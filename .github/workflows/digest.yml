@@ -1,8 +1,8 @@
-name: Daily digest
+name: Weekly digest
 
 on:
   schedule:
-    - cron: "0 22 * * *"   # 22:00 UTC = 07:00 JST. Edit to taste.
+    - cron: "0 22 * * 6"   # Sat 22:00 UTC = Sun 07:00 JST (weekly). Edit to taste.
   workflow_dispatch:        # lets you run it manually from the Actions tab
 
 permissions:
