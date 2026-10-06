@@ -11,8 +11,14 @@ How items are chosen
               never make an item eligible by themselves.
   quality   : source bonus, trusted-author bonus, Hugging Face upvotes (only
               counted when the item is actually on-topic).
+  recency   : newer items get a ranking bonus; older ones can still win if strong.
   layout    : "Read these first" (best few), "Also worth a look", and a small
               "Training & methods" slot for popular training-technique papers.
+
+Window: every run considers the last 30 days. Only items actually shown are
+marked as seen, so strong near-misses carry over to later weeks and quiet weeks
+are topped up from the backlog. Because of that the run time/cadence does not
+matter (any gap up to 30 days is covered).
 """
 import html
 import json
@@ -37,15 +43,19 @@ MAX_MORE = 8              # "Also worth a look"
 MAX_TRAINING = 2          # "Training & methods"
 MAX_PER_SOURCE_TOP = 3    # so one blog can't fill the top section
 MAX_PER_SOURCE_MORE = 4
-MAX_AGE_HOURS = 8 * 24    # weekly run + a day of slack
+MAX_AGE_HOURS = 30 * 24   # candidate window
+RECENT_DAYS, RECENT_BONUS = 7, 3    # ranking bonus: published in the last week
+MID_DAYS, MID_BONUS = 14, 1         # ... or the last two weeks
 MIN_RELEVANCE = 3         # needed (together with a core term) to be eligible
 AUTHOR_BONUS = 8          # per trusted author on a paper (max 2 counted)
 UPVOTE_STEP = 20          # +1 ranking point per this many HF upvotes ...
 UPVOTE_BONUS_MAX = 4      # ... up to this many, and only if the paper is on-topic
 TRAINING_MIN_UPVOTES = 60 # popular training-technique papers get the small slot
 TRAINING_MIN_SCORE = 3
-HF_LOOKBACK_DAYS = 8
+HF_LOOKBACK_DAYS = 30
 PAGE_MAX_NEW = 10         # newest N links on a no-feed index page are considered
+ARXIV_PAGE = 100          # results per arXiv API request
+ARXIV_MAX_PAGES = 4       # pages per keyword query (400 newest matches)
 SEEN_FILE = Path("seen.json")
 UA = "Mozilla/5.0 (compatible; safety-digest/1.0; personal feed reader)"
 
@@ -238,8 +248,27 @@ def fmt_date(dt):
 
 def parse_iso(stamp):
     try:
-        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except (AttributeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def display_to_datetime(text):
+    """'4 Oct 2026' -> datetime; 'Oct 2026' -> late in that month; year-only -> None."""
+    m = re.fullmatch(r"(\d{1,2}) ([A-Za-z]{3}) (\d{4})", text or "")
+    if m and m.group(2).lower() in _MON:
+        return _mk_dt(m.group(3), _MON[m.group(2).lower()], m.group(1))
+    m = re.fullmatch(r"([A-Za-z]{3}) (\d{4})", text or "")
+    if m and m.group(1).lower() in _MON:
+        return _mk_dt(m.group(2), _MON[m.group(1).lower()], 28)
+    return None
+
+
+def _mk_dt(y, m, d):
+    try:
+        return datetime(int(y), int(m), int(d), tzinfo=timezone.utc)
+    except ValueError:
         return None
 
 
@@ -402,18 +431,22 @@ def first_paragraph(paragraphs, min_len=120):
 
 
 # ---------------------------------------------------------------- sources ---
-def arxiv_url(search_query, n):
+def arxiv_url(search_query):
     return (
         "https://export.arxiv.org/api/query?search_query=" + quote(search_query)
-        + f"&sortBy=submittedDate&sortOrder=descending&max_results={n}"
+        + f"&sortBy=submittedDate&sortOrder=descending&max_results={ARXIV_PAGE}"
     )
 
 
-def arxiv_keyword_urls():
+def arxiv_keyword_urls(chunk=19):
+    """Several short queries rather than one huge one."""
     terms = PRIORITY_KEYWORDS + SAFETY_KEYWORDS
-    kw = " OR ".join(f'all:"{t}"' for t in terms)
     cats = " OR ".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
-    return [arxiv_url(f"({cats}) AND ({kw})", 300)]
+    urls = []
+    for i in range(0, len(terms), chunk):
+        kw = " OR ".join(f'all:"{t}"' for t in terms[i:i + chunk])
+        urls.append(arxiv_url(f"({cats}) AND ({kw})"))
+    return urls
 
 
 def arxiv_author_urls(chunk=20):
@@ -421,7 +454,7 @@ def arxiv_author_urls(chunk=20):
     urls = []
     for i in range(0, len(TRUSTED_AUTHORS), chunk):
         au = " OR ".join(f'au:"{a}"' for a in TRUSTED_AUTHORS[i:i + chunk])
-        urls.append(arxiv_url(f"({cats}) AND ({au})", 100))
+        urls.append(arxiv_url(f"({cats}) AND ({au})"))
     return urls
 
 
@@ -458,17 +491,9 @@ def parse_feed(url, retries=0):
     return feed, diag
 
 
-def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors, retries=0):
+def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
     items = []
-    try:
-        feed, diag = parse_feed(url, retries)
-    except Exception as exc:
-        errors.append(f"{name}: {exc}")
-        return items
-    if not feed.entries:
-        errors.append(f"{name}: no entries ({diag}) - {url[:110]}")
-        return items
-    for e in feed.entries:
+    for e in entries:
         uid = e.get("id") or e.get("link")
         if is_paper and uid:
             m = re.search(r"arxiv\.org/abs/(.+?)(?:v\d+)?$", uid)
@@ -493,12 +518,44 @@ def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors, retries=0):
             "id": uid, "source": name, "title": title, "summary": clean(raw, 320),
             "link": e.get("link", uid), "score": rel + min(train, 3) + extra,
             "strong": strong, "training_only": training_only, "trusted": trusted,
-            "upvotes": None, "date": fmt_date(when),
+            "upvotes": None, "date": fmt_date(when), "when": when,
         })
     return items
 
 
-def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
+def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors, retries=0):
+    try:
+        feed, diag = parse_feed(url, retries)
+    except Exception as exc:
+        errors.append(f"{name}: {exc}")
+        return []
+    if not feed.entries:
+        errors.append(f"{name}: no entries ({diag}) - {url[:110]}")
+        return []
+    return entries_to_items(feed.entries, name, always, bonus, is_paper, seen, cutoff)
+
+
+def fetch_arxiv(name, url, seen, cutoff, errors, max_pages):
+    """Page back through an arXiv API query until it is older than the cutoff.
+    Returns (items, first_page_ok)."""
+    items = []
+    for page in range(max_pages):
+        if page:
+            time.sleep(5)               # arXiv asks for spacing between calls
+        feed, diag = parse_feed(f"{url}&start={page * ARXIV_PAGE}", retries=2)
+        if not feed.entries:
+            if page == 0:
+                errors.append(f"{name}: no entries ({diag}) - {url[:110]}")
+                return items, False
+            break
+        items += entries_to_items(feed.entries, name, False, 0, True, seen, cutoff)
+        times = [t for t in (entry_time(e) for e in feed.entries) if t]
+        if len(feed.entries) < ARXIV_PAGE or (times and min(times) < cutoff):
+            break
+    return items, True
+
+
+def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cutoff=None):
     try:
         page, final_url = http_get(index_url)
     except Exception as exc:
@@ -531,6 +588,10 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
         ap.feed(art)
         title = clean_title(clean(ap.meta.get("og:title") or ap.title, 200), full)
         nodes = p.anchors.get(href, [])
+        date = page_date(ap, art, nodes, full)
+        when = display_to_datetime(date)
+        if cutoff and when and when < cutoff:
+            continue
         # description: page meta -> blurb on the index page -> first real paragraph
         desc = ap.meta.get("og:description") or ap.meta.get("description") or ""
         if len(clean(desc)) < 40:
@@ -545,7 +606,7 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
             "id": nid, "source": name, "title": title, "summary": clean(desc, 320),
             "link": full, "score": rel + min(train, 3) + bonus, "strong": strong,
             "training_only": training_only, "trusted": [], "upvotes": None,
-            "date": page_date(ap, art, nodes, full),
+            "date": date, "when": when,
         })
     return items
 
@@ -581,7 +642,7 @@ def fetch_hf_papers(seen, now, errors):
         f"{HF_BASE}?date={(now - timedelta(days=d)):%Y-%m-%d}&limit=100"
         for d in range(1, HF_LOOKBACK_DAYS + 1)
     ]
-    rows, ok_calls, last_err = [], 0, ""
+    rows, ok_calls, fails, last_err = [], 0, 0, ""
     for i, url in enumerate(urls):
         if i:
             time.sleep(1)
@@ -590,6 +651,9 @@ def fetch_hf_papers(seen, now, errors):
             data = json.loads(text)
         except Exception as exc:
             last_err = str(exc)
+            fails += 1
+            if not ok_calls and fails >= 3:   # HF unreachable: stop early
+                break
             continue
         if isinstance(data, list):
             ok_calls += 1
@@ -625,7 +689,7 @@ def fetch_hf_papers(seen, now, errors):
             "title": title, "summary": clean(abstract, 320),
             "link": f"https://arxiv.org/abs/{pid}", "score": rel + min(train, 3) + bonus,
             "strong": strong, "training_only": training_only, "trusted": trusted,
-            "upvotes": upv,
+            "upvotes": upv, "when": when,
             "date": fmt_date(parse_iso(row.get("publishedAt")) or when),
         })
     return items
@@ -654,8 +718,25 @@ def take(items, n, per_source):
     return out
 
 
-def select(items):
+def recency_bonus(when, now):
+    if not when:
+        return 0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    age = now - when
+    if age <= timedelta(days=RECENT_DAYS):
+        return RECENT_BONUS
+    if age <= timedelta(days=MID_DAYS):
+        return MID_BONUS
+    return 0
+
+
+def select(items, now=None):
+    now = now or datetime.now(timezone.utc)
     pool = merge(items)
+    for it in pool:
+        it["rank"] = it["score"] + recency_bonus(it.get("when"), now)
+    pool.sort(key=lambda x: x["rank"], reverse=True)
     top = take([i for i in pool if i["strong"] and not i["training_only"]],
                TOP_PICKS, MAX_PER_SOURCE_TOP)
     used = {i["id"] for i in top}
@@ -743,36 +824,43 @@ def main():
     for name, url, always, bonus in FEEDS:
         items += fetch(name, url, always, bonus, False, seen, cutoff, errors)
     for name, url, link_re, always, bonus in PAGES:
-        items += fetch_page_source(name, url, link_re, always, bonus, seen, errors)
+        items += fetch_page_source(name, url, link_re, always, bonus, seen, errors, cutoff)
 
-    arxiv_urls = [("arXiv", u) for u in arxiv_keyword_urls()] + \
-                 [("arXiv (trusted authors)", u) for u in arxiv_author_urls()]
-    for i, (name, url) in enumerate(arxiv_urls):
+    jobs = [("arXiv", u, ARXIV_MAX_PAGES) for u in arxiv_keyword_urls()] + \
+           [("arXiv (trusted authors)", u, 3) for u in arxiv_author_urls()]
+    failed_in_a_row = 0
+    for i, (name, url, pages) in enumerate(jobs):
         if i:
-            time.sleep(5)  # arXiv asks for spacing between API calls
-        items += fetch(name, url, False, 0, True, seen, cutoff, errors, retries=2)
+            time.sleep(5)
+        got, ok = fetch_arxiv(name, url, seen, cutoff, errors, pages)
+        items += got
+        failed_in_a_row = 0 if ok else failed_in_a_row + 1
+        if failed_in_a_row >= 2:
+            errors.append("arXiv: two queries in a row failed, skipping the rest this run")
+            break
     items += fetch_hf_papers(seen, now, errors)
 
-    top, more, training, pool = select(items)
+    top, more, training, pool = select(items, now)
     chosen = top + more + training
     enrich_descriptions(chosen)
     page, text = render(top, more, training, errors)
     if dry:
         Path("digest.html").write_text(page)
         print(f"dry run: {len(top)} top, {len(more)} more, {len(training)} training, "
-              f"{len(pool)} eligible, {len(errors)} feed errors")
+              f"{len(pool)} eligible in window, {len(errors)} feed errors")
         return
 
     send(page, text, len(chosen))
 
-    # Everything eligible this week counts as seen: if it didn't make the cut it
-    # shouldn't resurface later as "new".
-    for it in pool:
+    # Only what was actually shown counts as seen; strong near-misses stay
+    # eligible (until they age out of the 30-day window) and carry over.
+    for it in chosen:
         seen[it["id"]] = now.isoformat()
-    keep_after = (now - timedelta(days=45)).isoformat()
+    keep_after = (now - timedelta(days=180)).isoformat()
     seen = {k: v for k, v in seen.items() if v >= keep_after}
     SEEN_FILE.write_text(json.dumps(seen, indent=1))
 
 
 if __name__ == "__main__":
     main()
+
