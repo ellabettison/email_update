@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Daily AI-safety reading digest.
+"""Weekly AI-safety reading digest.
 
 Free to run: GitHub Actions does the scheduling, Gmail SMTP sends the email.
 Usage:  python digest.py            (sends email)
         python digest.py --dry-run  (writes digest.html, sends nothing)
 
-Ranking = keyword relevance + quality proxies:
-  * per-source bonus (trusted blogs/curators outrank generic feeds)
-  * trusted-author bonus for arXiv papers
-  * karma thresholds on LessWrong / Alignment Forum feeds
-Keyword relevance is always required, so a trusted source never pushes in
-something off-topic.
+How items are chosen
+  relevance : keyword score. Model-psychology terms weigh most, then core safety
+              terms. Generic ML terms (RLHF, fine-tuning, "alignment" on its own)
+              never make an item eligible by themselves.
+  quality   : source bonus, trusted-author bonus, Hugging Face upvotes (only
+              counted when the item is actually on-topic).
+  layout    : "Read these first" (best few), "Also worth a look", and a small
+              "Training & methods" slot for popular training-technique papers.
 """
 import html
 import json
@@ -22,31 +24,38 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
-from pathlib import Path
 from html.parser import HTMLParser
+from pathlib import Path
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
 import feedparser
 
 # ---------------------------------------------------------------- config ---
-MAX_BLOG_ITEMS = 8
-MAX_PAPERS = 8
-MAX_AGE_HOURS = 72
-MIN_SCORE_BLOG = 2        # keyword score needed from non-curated feeds
-MIN_SCORE_PAPER = 3       # keyword score needed for arXiv papers by unknown authors
-TRUSTED_MIN_KW = 2        # keyword score needed for papers by trusted authors
+TOP_PICKS = 5             # "Read these first"
+MAX_MORE = 8              # "Also worth a look"
+MAX_TRAINING = 2          # "Training & methods"
+MAX_PER_SOURCE_TOP = 3    # so one blog can't fill the top section
+MAX_PER_SOURCE_MORE = 4
+MAX_AGE_HOURS = 8 * 24    # weekly run + a day of slack
+MIN_RELEVANCE = 3         # needed (together with a core term) to be eligible
 AUTHOR_BONUS = 8          # per trusted author on a paper (max 2 counted)
+UPVOTE_STEP = 20          # +1 ranking point per this many HF upvotes ...
+UPVOTE_BONUS_MAX = 4      # ... up to this many, and only if the paper is on-topic
+TRAINING_MIN_UPVOTES = 60 # popular training-technique papers get the small slot
+TRAINING_MIN_SCORE = 3
+HF_LOOKBACK_DAYS = 8
+PAGE_MAX_NEW = 10         # newest N links on a no-feed index page are considered
 SEEN_FILE = Path("seen.json")
+UA = "Mozilla/5.0 (compatible; safety-digest/1.0; personal feed reader)"
 
 # (name, url, always_include, source_bonus)
 # always_include=True  -> every new item is eligible (low volume, high signal)
-# always_include=False -> item must also match your keywords (MIN_SCORE_BLOG)
+# always_include=False -> the item must also match your keywords
 # Bonus only affects ranking, never eligibility.
-# Verified live: the LessWrong feed format (view=frontpage). view=curated and
-# karmaThreshold are documented as officially supported; karmaThreshold snaps
-# to 2/30/45/75/125/200. Unverified: the Alignment Forum URL (same codebase).
-# Broken feeds are listed at the bottom of the email.
+# Verified live: LessWrong feed format. view=curated and karmaThreshold are
+# documented as supported (thresholds snap to 2/30/45/75/125/200).
+# Unverified: the Alignment Forum URL. Broken feeds are listed in the email.
 FEEDS = [
     ("LessWrong (curated)", "https://www.lesswrong.com/feed.xml?view=curated", True, 6),
     ("LessWrong (karma 45+)", "https://www.lesswrong.com/feed.xml?view=frontpage&karmaThreshold=45", False, 3),
@@ -67,42 +76,48 @@ FEEDS = [
     ("Hugging Face blog", "https://huggingface.co/blog/feed.xml", False, 0),
 ]
 
-# Sites with no RSS feed: the script reads the index page, finds links that match
-# link_regex, and reads each new article's title/description from its own page.
+# Sites with no RSS feed: read the index page, take the newest PAGE_MAX_NEW
+# links matching link_regex, read each article's title/description/date.
 # (name, index_url, link_regex, always_include, source_bonus)
 PAGES = [
     ("Anthropic Alignment Science", "https://alignment.anthropic.com/",
      r"^https://alignment\.anthropic\.com/\d{4}/", True, 9),
 ]
-HF_URL = "https://huggingface.co/api/daily_papers?limit=100"
-HF_MAX_AGE_HOURS = 120    # daily papers skip weekends, so look back further
-HF_STRONG_UPVOTES = 25    # this many upvotes lowers the keyword bar by 1
-PAGE_MAX_NEW = 6          # articles inspected per page per run (newest first)
 
-# Model psychology / behaviour: weighted higher.
+HF_BASE = "https://huggingface.co/api/daily_papers"
+
+# Model psychology / behaviour. Title hit = 6, abstract/body hit = 3.
 PRIORITY_KEYWORDS = [
-    "sycophancy", "persona", "deception", "alignment faking", "jailbreak",
-    "sandbagging", "introspection", "emergent misalignment", "reward hacking",
-    "scheming", "manipulative", "user manipulation", "situational awareness", "self-knowledge",
-    "model psychology", "model character", "character training", "honesty", "persuasion", "role-play",
-    "chain of thought", "chain-of-thought", "unfaithful", "backdoor",
+    "sycophancy", "sycophantic", "persona", "deception", "deceptive", "alignment faking",
+    "jailbreak", "jailbreaking", "sandbagging", "introspection", "emergent misalignment",
+    "agentic misalignment", "reward hacking", "scheming", "self-preservation",
+    "situational awareness", "evaluation awareness", "model psychology", "model character",
+    "character training", "honesty", "persuasion", "role-play", "roleplay", "unfaithful",
+    "backdoor", "sleeper agent", "model organism", "lie detector", "lie detection",
+    "manipulative", "user manipulation",
 ]
-# Wider safety / training coverage.
-BROAD_KEYWORDS = [
-    "alignment", "ai safety", "interpretability", "mechanistic", "sparse autoencoder",
-    "steering", "probing", "red teaming", "red-teaming", "ai control", "oversight",
-    "rlhf", "rlvr", "rlaif", "reinforcement learning", "post-training",
-    "preference optimization", "dpo", "constitutional", "evaluation",
-    "dangerous capabilities", "misalignment", "robustness", "adversarial",
-    "monitoring", "scalable oversight", "reward model", "fine-tuning",
+# Core safety terms. Title hit = 4, abstract/body hit = 2.
+SAFETY_KEYWORDS = [
+    "ai safety", "misalignment", "interpretability", "mechanistic interpretability",
+    "sparse autoencoder", "activation steering", "red teaming", "red-teaming",
+    "ai control", "oversight", "scalable oversight", "dangerous capabilities",
+    "monitorability", "cot monitoring", "chain-of-thought monitoring", "ai monitor",
+    "cot faithfulness", "chain-of-thought faithfulness", "safety training",
+    "constitutional ai", "model spec", "alignment research", "alignment training",
+]
+# Training-technique terms. Title hit = 2, body hit = 1. Never sufficient alone
+# for ordinary eligibility; they only qualify popular papers for the small slot.
+TRAINING_KEYWORDS = [
+    "alignment", "rlhf", "rlvr", "rlaif", "reinforcement learning", "post-training",
+    "preference optimization", "dpo", "reward model", "fine-tuning", "distillation",
+    "on-policy", "chain of thought", "chain-of-thought",
 ]
 
 ARXIV_CATEGORIES = ["cs.CL", "cs.AI", "cs.LG"]
 
 # Researchers whose safety work is usually worth reading. My judgement, biased
 # toward model behaviour/psychology, then interpretability, then control/evals.
-# Matching is on exact full names as arXiv prints them, so initials-only or
-# variant spellings will be missed. Edit freely.
+# Matching is on exact full names as arXiv prints them. Edit freely.
 TRUSTED_AUTHORS = [
     # behaviour, persona, deception
     "Owain Evans", "Jan Betley", "James Chua", "Evan Hubinger", "Ethan Perez",
@@ -136,12 +151,23 @@ def clean(text, limit=300):
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
+def clean_title(title, url=""):
+    """Drop unrendered template placeholders such as '{title}'."""
+    t = re.sub(r"\{[^{}]*\}", "", title or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t and url:
+        slug = url.rstrip("/").rsplit("/", 1)[-1]
+        t = slug.replace("-", " ").replace("_", " ").title()
+    return t
+
+
 def kw_regex(kw):
-    return re.compile(r"\b" + re.escape(kw) + r"\b", re.I)
+    return re.compile(r"\b" + re.escape(kw) + r"s?\b", re.I)
 
 
 PRIORITY_RE = [kw_regex(k) for k in PRIORITY_KEYWORDS]
-BROAD_RE = [kw_regex(k) for k in BROAD_KEYWORDS]
+SAFETY_RE = [kw_regex(k) for k in SAFETY_KEYWORDS]
+TRAINING_RE = [kw_regex(k) for k in TRAINING_KEYWORDS]
 
 
 def norm_name(n):
@@ -158,19 +184,38 @@ def trusted_in(entry):
     return [n for n in names if norm_name(n) in TRUSTED_NORM]
 
 
-def score(title, summary):
-    s = 0
+def score(title, text):
+    """-> (relevance, has_core_term, training_score)."""
+    rel, strong, train = 0, False, 0
     for rx in PRIORITY_RE:
         if rx.search(title):
-            s += 6
-        elif rx.search(summary):
-            s += 3
-    for rx in BROAD_RE:
+            rel, strong = rel + 6, True
+        elif rx.search(text):
+            rel, strong = rel + 3, True
+    for rx in SAFETY_RE:
         if rx.search(title):
-            s += 2
-        elif rx.search(summary):
-            s += 1
-    return s
+            rel, strong = rel + 4, True
+        elif rx.search(text):
+            rel, strong = rel + 2, True
+    for rx in TRAINING_RE:
+        if rx.search(title):
+            train += 2
+        elif rx.search(text):
+            train += 1
+    return rel, strong, train
+
+
+def judge(rel, strong, train, always=False, trusted=False, upvotes=None):
+    """-> (eligible, training_only)."""
+    if always:
+        return True, False
+    if strong and rel >= MIN_RELEVANCE:
+        return True, False
+    if trusted and strong:
+        return True, False
+    if upvotes is not None and upvotes >= TRAINING_MIN_UPVOTES and train >= TRAINING_MIN_SCORE:
+        return True, True
+    return False, False
 
 
 def entry_time(e):
@@ -181,21 +226,194 @@ def entry_time(e):
     return None
 
 
-def arxiv_url(search_query):
+# ----------------------------------------------------------------- dates ---
+_MON = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_MON_RE = r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
+
+
+def fmt_date(dt):
+    return f"{dt.day} {dt:%b %Y}" if dt else ""
+
+
+def parse_iso(stamp):
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _mk(y, m, d):
+    try:
+        return fmt_date(datetime(int(y), int(m), int(d)))
+    except ValueError:
+        return ""
+
+
+def parse_full_date(text):
+    """Day-precision dates only: ISO, '4 Oct 2026', 'Oct 4, 2026'."""
+    text = text or ""
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})", text)
+    if m:
+        return _mk(m.group(1), m.group(2), m.group(3))
+    m = re.search(rf"\b(\d{{1,2}})\s+{_MON_RE},?\s+(\d{{4}})\b", text, re.I)
+    if m:
+        return _mk(m.group(3), _MON[m.group(2).lower()], m.group(1))
+    m = re.search(rf"\b{_MON_RE}\s+(\d{{1,2}}),?\s+(\d{{4}})\b", text, re.I)
+    if m:
+        return _mk(m.group(3), _MON[m.group(1).lower()], m.group(2))
+    return ""
+
+
+def parse_date_str(text):
+    full = parse_full_date(text)
+    if full:
+        return full
+    m = re.search(rf"\b{_MON_RE}\s+(\d{{4}})\b", text or "", re.I)
+    if m:
+        return f"{m.group(1).title()[:3]} {m.group(2)}"
+    return ""
+
+
+DATE_META_KEYS = [
+    "article:published_time", "og:article:published_time", "citation_publication_date",
+    "citation_date", "dc.date", "dcterms.date", "date", "pubdate", "publish_date",
+    "published_time",
+]
+
+
+def page_date(ap, raw_html, index_nodes, url):
+    """Best-effort publication date for a page that has no feed. Returns text."""
+    for k in DATE_META_KEYS:
+        d = parse_date_str(ap.meta.get(k))
+        if d:
+            return d
+    for t in ap.times:
+        d = parse_date_str(t)
+        if d:
+            return d
+    m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', raw_html or "")
+    if m and parse_date_str(m.group(1)):
+        return parse_date_str(m.group(1))
+    for n in index_nodes:                       # date shown beside the link on the index
+        d = parse_date_str(n)
+        if d:
+            return d
+    d = parse_full_date(ap.text_head)           # a full date near the top of the article
+    if d:
+        return d
+    m = re.search(r"/(20\d{2})/", url)          # last resort: year from the URL
+    return m.group(1) if m else ""
+
+
+# ------------------------------------------------------- html / http utils ---
+class _LinkMeta(HTMLParser):
+    """Collects links (with their text), <meta>, <title>, <time>, paragraphs."""
+
+    def __init__(self):
+        super().__init__()
+        self.links, self.meta, self.title, self._in_title = [], {}, "", False
+        self.anchors, self._href = {}, None      # href -> text nodes inside the link
+        self.paragraphs, self._p = [], None
+        self.times = []                          # <time datetime="...">
+        self.text_head, self._skip = "", 0       # first ~2500 chars of visible text
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag in ("script", "style"):
+            self._skip += 1
+        if tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+            self._href = a["href"]
+            self.anchors.setdefault(self._href, [])
+        elif tag == "meta":
+            key = (a.get("property") or a.get("name") or "").lower()
+            if key and a.get("content"):
+                self.meta.setdefault(key, a["content"])
+        elif tag == "title":
+            self._in_title = True
+        elif tag == "time" and a.get("datetime"):
+            self.times.append(a["datetime"])
+        elif tag == "p":
+            self._p = []
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style") and self._skip:
+            self._skip -= 1
+        if tag == "title":
+            self._in_title = False
+        elif tag == "a":
+            self._href = None
+        elif tag == "p" and self._p is not None:
+            txt = " ".join("".join(self._p).split())
+            if txt:
+                self.paragraphs.append(txt)
+            self._p = None
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        if self._in_title:
+            self.title += data
+        text = " ".join(data.split())
+        if text:
+            if self._href is not None:
+                self.anchors[self._href].append(text)
+            if len(self.text_head) < 2500:
+                self.text_head += text + " "
+        if self._p is not None:
+            self._p.append(data)
+
+
+def http_get(url):
+    req = Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, "
+                  "application/json, text/html;q=0.9, */*;q=0.8",
+    })
+    with urlopen(req, timeout=30) as r:
+        text = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
+        return text, r.geturl()
+
+
+def norm_url(u):
+    u = u.split("#")[0]
+    u = re.sub(r"/index\.html$", "/", u)
+    return u.rstrip("/")
+
+
+def anchor_description(nodes, title):
+    """Index pages often put title + blurb inside the link; take the blurb."""
+    t = title.lower()
+    cands = [n for n in nodes if n.lower() != t]
+    if not cands:
+        return ""
+    best = max(cands, key=len)
+    if best.lower().startswith(t):
+        best = best[len(title):].lstrip(" -\u2013\u2014:|")
+        # title + "Author, Author, 2026" + blurb squashed into one text node:
+        # drop the author/year run (short, no full stop, ends ", YYYY").
+        best = re.sub(r"^[^.]{0,150}?,\s*20\d{2}\s+(?=[A-Z])", "", best)
+    return best
+
+
+def first_paragraph(paragraphs, min_len=120):
+    return next((p for p in paragraphs if len(p) >= min_len), "")
+
+
+# ---------------------------------------------------------------- sources ---
+def arxiv_url(search_query, n):
     return (
         "https://export.arxiv.org/api/query?search_query=" + quote(search_query)
-        + "&sortBy=submittedDate&sortOrder=descending&max_results=150"
+        + f"&sortBy=submittedDate&sortOrder=descending&max_results={n}"
     )
 
 
 def arxiv_keyword_urls():
-    terms = PRIORITY_KEYWORDS + [
-        "alignment", "AI safety", "interpretability", "red teaming",
-        "reward model", "RLHF", "post-training", "AI control", "misalignment",
-    ]
+    terms = PRIORITY_KEYWORDS + SAFETY_KEYWORDS
     kw = " OR ".join(f'all:"{t}"' for t in terms)
     cats = " OR ".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
-    return [arxiv_url(f"({cats}) AND ({kw})")]
+    return [arxiv_url(f"({cats}) AND ({kw})", 300)]
 
 
 def arxiv_author_urls(chunk=20):
@@ -203,7 +421,7 @@ def arxiv_author_urls(chunk=20):
     urls = []
     for i in range(0, len(TRUSTED_AUTHORS), chunk):
         au = " OR ".join(f'au:"{a}"' for a in TRUSTED_AUTHORS[i:i + chunk])
-        urls.append(arxiv_url(f"({cats}) AND ({au})"))
+        urls.append(arxiv_url(f"({cats}) AND ({au})", 100))
     return urls
 
 
@@ -216,15 +434,39 @@ def load_seen():
     return {}
 
 
-def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors):
+def parse_feed(url, retries=0):
+    """feedparser with retries, a plain-fetch fallback, and a useful diagnosis."""
+    feed, diag = None, ""
+    for attempt in range(retries + 1):
+        feed = feedparser.parse(url, agent=UA)
+        if feed.entries:
+            return feed, ""
+        diag = f"HTTP {feed.get('status', 'n/a')}"
+        exc = feed.get("bozo_exception")
+        if exc:
+            diag += f", {type(exc).__name__}: {str(exc)[:80]}"
+        if attempt < retries:
+            time.sleep(10 * (attempt + 1))
+    if url.startswith("http"):       # some hosts reject feedparser's own fetch
+        try:
+            text, _ = http_get(url)
+            alt = feedparser.parse(text)
+            if alt.entries:
+                return alt, ""
+        except Exception as exc:
+            diag += f"; plain fetch failed: {exc}"
+    return feed, diag
+
+
+def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors, retries=0):
     items = []
     try:
-        feed = feedparser.parse(url, agent="safety-digest/1.0")
+        feed, diag = parse_feed(url, retries)
     except Exception as exc:
         errors.append(f"{name}: {exc}")
         return items
     if not feed.entries:
-        errors.append(f"{name}: no entries returned (check URL) - {url[:120]}")
+        errors.append(f"{name}: no entries ({diag}) - {url[:110]}")
         return items
     for e in feed.entries:
         uid = e.get("id") or e.get("link")
@@ -238,77 +480,22 @@ def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors):
         if when and when < cutoff:
             continue
         raw = e.get("summary") or e.get("description")
-        title = clean(e.get("title"), 200)
-        summary = clean(raw, 320)
-        # Some feeds (LessWrong) ship the whole post; score on the opening
-        # ~1500 chars, not just the 320 shown in the email.
-        kw = score(title, clean(raw, 1500))
-
+        title = clean_title(clean(e.get("title"), 200), e.get("link", ""))
+        # Some feeds (LessWrong) ship the whole post: score the opening ~1500
+        # chars, but only show 320.
+        rel, strong, train = score(title, clean(raw, 1500))
         trusted = trusted_in(e) if is_paper else []
-        if is_paper:
-            floor = TRUSTED_MIN_KW if trusted else MIN_SCORE_PAPER
-            bonus_total = AUTHOR_BONUS * min(len(trusted), 2)
-        else:
-            floor = 0 if always else MIN_SCORE_BLOG
-            bonus_total = bonus
-        if kw < floor:
+        ok, training_only = judge(rel, strong, train, always, bool(trusted))
+        if not ok:
             continue
+        extra = AUTHOR_BONUS * min(len(trusted), 2) if is_paper else bonus
         items.append({
-            "id": uid, "source": name, "title": title, "summary": summary,
-            "link": e.get("link", uid), "score": kw + bonus_total,
-            "trusted": trusted, "when": when, "upvotes": None,
+            "id": uid, "source": name, "title": title, "summary": clean(raw, 320),
+            "link": e.get("link", uid), "score": rel + min(train, 3) + extra,
+            "strong": strong, "training_only": training_only, "trusted": trusted,
+            "upvotes": None, "date": fmt_date(when),
         })
     return items
-
-
-def merge(items):
-    """Same post can arrive via several feeds/queries; keep the best-scored."""
-    best = {}
-    for it in items:
-        cur = best.get(it["id"])
-        if cur is None or it["score"] > cur["score"]:
-            best[it["id"]] = it
-    return sorted(best.values(), key=lambda x: x["score"], reverse=True)
-
-
-class _LinkMeta(HTMLParser):
-    """Collects <a href>, <meta> tags and <title> from an HTML page."""
-
-    def __init__(self):
-        super().__init__()
-        self.links, self.meta, self.title, self._in_title = [], {}, "", False
-
-    def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
-        if tag == "a" and a.get("href"):
-            self.links.append(a["href"])
-        elif tag == "meta":
-            key = (a.get("property") or a.get("name") or "").lower()
-            if key and a.get("content"):
-                self.meta.setdefault(key, a["content"])
-        elif tag == "title":
-            self._in_title = True
-
-    def handle_endtag(self, tag):
-        if tag == "title":
-            self._in_title = False
-
-    def handle_data(self, data):
-        if self._in_title:
-            self.title += data
-
-
-def http_get(url):
-    req = Request(url, headers={"User-Agent": "safety-digest/1.0 (personal use)"})
-    with urlopen(req, timeout=30) as r:
-        text = r.read().decode(r.headers.get_content_charset() or "utf-8", "replace")
-        return text, r.geturl()
-
-
-def norm_url(u):
-    u = u.split("#")[0]
-    u = re.sub(r"/index\.html$", "/", u)
-    return u.rstrip("/")
 
 
 def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
@@ -326,13 +513,14 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
         if not re.search(link_re, full) or nid == norm_url(final_url) or nid in ids:
             continue
         ids.add(nid)
-        found.append((nid, full))
+        found.append((nid, full, href))
     if not found:
         errors.append(f"{name}: no article links matched on {index_url} (site layout changed?)")
         return []
     items = []
-    unseen = [(n, f) for n, f in found if n not in seen][:PAGE_MAX_NEW]
-    for nid, full in unseen:
+    # Only the newest PAGE_MAX_NEW links are ever considered, so older posts
+    # can never trickle in one batch at a time.
+    for nid, full, href in [t for t in found[:PAGE_MAX_NEW] if t[0] not in seen]:
         try:
             art, _ = http_get(full)
         except Exception as exc:
@@ -341,102 +529,193 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors):
         time.sleep(1)
         ap = _LinkMeta()
         ap.feed(art)
-        title = clean(ap.meta.get("og:title") or ap.title or full, 200)
-        summary = clean(ap.meta.get("og:description") or ap.meta.get("description") or "", 320)
-        kw = score(title, summary)
-        if kw < (0 if always else MIN_SCORE_BLOG):
+        title = clean_title(clean(ap.meta.get("og:title") or ap.title, 200), full)
+        nodes = p.anchors.get(href, [])
+        # description: page meta -> blurb on the index page -> first real paragraph
+        desc = ap.meta.get("og:description") or ap.meta.get("description") or ""
+        if len(clean(desc)) < 40:
+            desc = anchor_description(nodes, title)
+        if len(clean(desc)) < 40:
+            desc = first_paragraph(ap.paragraphs)
+        rel, strong, train = score(title, clean(desc, 1500))
+        ok, training_only = judge(rel, strong, train, always)
+        if not ok:
             continue
-        items.append({"id": nid, "source": name, "title": title, "summary": summary,
-                      "link": full, "score": kw + bonus, "trusted": [], "when": None,
-                      "upvotes": None})
-    return items
-
-
-def fetch_hf_papers(seen, now, errors):
-    """Hugging Face daily papers: community upvotes as a quality signal."""
-    try:
-        text, _ = http_get(HF_URL)
-        data = json.loads(text)
-    except Exception as exc:
-        errors.append(f"Hugging Face daily papers: {exc}")
-        return []
-    if not isinstance(data, list) or not data:
-        errors.append("Hugging Face daily papers: empty or unexpected response")
-        return []
-    cutoff = now - timedelta(hours=HF_MAX_AGE_HOURS)
-    items = []
-    for row in data:
-        p = row.get("paper") or {}
-        pid = p.get("id")
-        if not pid or f"arxiv:{pid}" in seen:
-            continue
-        stamp = p.get("submittedOnDailyAt") or row.get("publishedAt")
-        try:
-            when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-        except (AttributeError, ValueError):
-            when = None
-        if when and when < cutoff:
-            continue
-        title = clean(p.get("title") or row.get("title"), 200)
-        abstract = clean(p.get("summary") or row.get("summary"), 1500)
-        upv = p.get("upvotes") or 0
-        trusted = [a["name"] for a in p.get("authors", [])
-                   if norm_name(a.get("name", "")) in TRUSTED_NORM]
-        kw = score(title, abstract)
-        floor = MIN_SCORE_PAPER - (1 if upv >= HF_STRONG_UPVOTES else 0)
-        if trusted:
-            floor = min(floor, TRUSTED_MIN_KW)
-        if kw < floor:
-            continue
-        bonus = min(upv // 10, 6) + AUTHOR_BONUS * min(len(trusted), 2)
         items.append({
-            "id": f"arxiv:{pid}", "source": "Hugging Face daily papers",
-            "title": title, "summary": clean(abstract, 320),
-            "link": f"https://arxiv.org/abs/{pid}", "score": kw + bonus,
-            "trusted": trusted, "when": when, "upvotes": upv,
+            "id": nid, "source": name, "title": title, "summary": clean(desc, 320),
+            "link": full, "score": rel + min(train, 3) + bonus, "strong": strong,
+            "training_only": training_only, "trusted": [], "upvotes": None,
+            "date": page_date(ap, art, nodes, full),
         })
     return items
 
 
-def render(blogs, papers, errors):
+def enrich_descriptions(items):
+    """Fill in missing/very short descriptions (and dates) from the article page."""
+    for it in items:
+        need_desc = len(it["summary"]) < 100
+        need_date = not it.get("date")
+        if not (need_desc or need_date) or not it["link"].startswith("http"):
+            continue
+        try:
+            art, _ = http_get(it["link"])
+        except Exception:
+            continue
+        time.sleep(1)
+        ap = _LinkMeta()
+        ap.feed(art)
+        if need_desc:
+            cand = clean(ap.meta.get("og:description") or ap.meta.get("description")
+                         or first_paragraph(ap.paragraphs), 320)
+            if len(cand) > len(it["summary"]):
+                it["summary"] = cand
+        if need_date:
+            it["date"] = page_date(ap, art, [], it["link"])
+
+
+def fetch_hf_papers(seen, now, errors):
+    """Hugging Face daily papers: community upvotes as a quality signal.
+    Daily lists skip weekends, so ask for the latest list plus each of the last
+    HF_LOOKBACK_DAYS dates."""
+    urls = [f"{HF_BASE}?limit=100"] + [
+        f"{HF_BASE}?date={(now - timedelta(days=d)):%Y-%m-%d}&limit=100"
+        for d in range(1, HF_LOOKBACK_DAYS + 1)
+    ]
+    rows, ok_calls, last_err = [], 0, ""
+    for i, url in enumerate(urls):
+        if i:
+            time.sleep(1)
+        try:
+            text, _ = http_get(url)
+            data = json.loads(text)
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+        if isinstance(data, list):
+            ok_calls += 1
+            rows += data
+    if not ok_calls:
+        errors.append(f"Hugging Face daily papers: all requests failed ({last_err})")
+        return []
+    cutoff = now - timedelta(hours=MAX_AGE_HOURS)
+    items, done = [], set()
+    for row in rows:
+        p = row.get("paper") or {}
+        pid = p.get("id")
+        if not pid or pid in done or f"arxiv:{pid}" in seen:
+            continue
+        done.add(pid)
+        when = parse_iso(p.get("submittedOnDailyAt") or row.get("publishedAt"))
+        if when and when < cutoff:
+            continue
+        title = clean_title(clean(p.get("title") or row.get("title"), 200))
+        abstract = clean(p.get("summary") or row.get("summary"), 1500)
+        upv = p.get("upvotes") or 0
+        trusted = [a["name"] for a in p.get("authors", [])
+                   if norm_name(a.get("name", "")) in TRUSTED_NORM]
+        rel, strong, train = score(title, abstract)
+        ok, training_only = judge(rel, strong, train, False, bool(trusted), upv)
+        if not ok:
+            continue
+        bonus = AUTHOR_BONUS * min(len(trusted), 2)
+        if strong:
+            bonus += min(upv // UPVOTE_STEP, UPVOTE_BONUS_MAX)
+        items.append({
+            "id": f"arxiv:{pid}", "source": "Hugging Face daily papers",
+            "title": title, "summary": clean(abstract, 320),
+            "link": f"https://arxiv.org/abs/{pid}", "score": rel + min(train, 3) + bonus,
+            "strong": strong, "training_only": training_only, "trusted": trusted,
+            "upvotes": upv,
+            "date": fmt_date(parse_iso(row.get("publishedAt")) or when),
+        })
+    return items
+
+
+# -------------------------------------------------------------- selection ---
+def merge(items):
+    """Same post can arrive via several feeds/queries; keep the best-scored."""
+    best = {}
+    for it in items:
+        cur = best.get(it["id"])
+        if cur is None or it["score"] > cur["score"]:
+            best[it["id"]] = it
+    return sorted(best.values(), key=lambda x: x["score"], reverse=True)
+
+
+def take(items, n, per_source):
+    out, counts = [], {}
+    for it in items:
+        if len(out) >= n:
+            break
+        if counts.get(it["source"], 0) >= per_source:
+            continue
+        counts[it["source"]] = counts.get(it["source"], 0) + 1
+        out.append(it)
+    return out
+
+
+def select(items):
+    pool = merge(items)
+    top = take([i for i in pool if i["strong"] and not i["training_only"]],
+               TOP_PICKS, MAX_PER_SOURCE_TOP)
+    used = {i["id"] for i in top}
+    rest = [i for i in pool if i["id"] not in used]
+    more = take([i for i in rest if not i["training_only"]], MAX_MORE, MAX_PER_SOURCE_MORE)
+    training = take([i for i in rest if i["training_only"]], MAX_TRAINING, MAX_TRAINING)
+    return top, more, training, pool
+
+
+# ----------------------------------------------------------------- output ---
+def render(top, more, training, errors):
     today = datetime.now(timezone.utc).strftime("%a %d %b %Y")
 
-    def block(heading, items):
+    def item_html(it, n):
+        badge = ""
+        if it["trusted"]:
+            badge = (" &middot; <span style='color:#b8860b'>&#9733; "
+                     + html.escape(", ".join(it["trusted"][:3])) + "</span>")
+        if it.get("upvotes"):
+            badge += f" &middot; <span style='color:#555'>&#9650; {it['upvotes']}</span>"
+        date_html = (f" &middot; {html.escape(it['date'])}" if it.get("date")
+                     else " &middot; <span style='color:#999'>date unknown</span>")
+        return (
+            "<div style='margin:0 0 14px'>"
+            f"<a href='{html.escape(it['link'])}' style='font-weight:600;"
+            f"text-decoration:none'>{html.escape(it['title'])}</a>"
+            f"<div style='color:#666;font-size:12px'>{html.escape(it['source'])}{date_html}{badge}</div>"
+            f"<div style='font-size:14px;margin-top:2px'>{html.escape(clean(it['summary'], n))}</div>"
+            "</div>"
+        )
+
+    def block(heading, items, n):
         if not items:
             return ""
-        out = [f"<h3 style='margin:24px 0 8px'>{heading}</h3>"]
-        for it in items:
-            badge = ""
-            if it["trusted"]:
-                badge = (" &middot; <span style='color:#b8860b'>&#9733; "
-                         + html.escape(", ".join(it["trusted"][:3])) + "</span>")
-            if it.get("upvotes"):
-                badge += f" &middot; <span style='color:#555'>&#9650; {it['upvotes']}</span>"
-            out.append(
-                "<div style='margin:0 0 14px'>"
-                f"<a href='{html.escape(it['link'])}' style='font-weight:600;"
-                f"text-decoration:none'>{html.escape(it['title'])}</a>"
-                f"<div style='color:#666;font-size:12px'>{html.escape(it['source'])}{badge}</div>"
-                f"<div style='font-size:14px;margin-top:2px'>{html.escape(it['summary'])}</div>"
-                "</div>"
-            )
-        return "".join(out)
+        return (f"<h3 style='margin:26px 0 8px'>{heading}</h3>"
+                + "".join(item_html(i, n) for i in items))
 
-    body = block("Blogs & newsletters", blogs) + block("New papers (arXiv)", papers)
+    body = (block("Read these first", top, 320)
+            + block("Also worth a look", more, 200)
+            + block("Training &amp; methods", training, 180))
     if not body:
-        body = "<p>Nothing new matched today.</p>"
+        body = "<p>Nothing new matched this week.</p>"
     err = ""
     if errors:
         err = ("<hr><p style='color:#a00;font-size:12px'>Feed problems:<br>"
                + "<br>".join(html.escape(x) for x in errors) + "</p>")
     page = (
         "<div style='font-family:-apple-system,Segoe UI,sans-serif;max-width:640px'>"
-        f"<h2 style='margin:0'>Safety digest</h2><div style='color:#666'>{today}</div>"
+        f"<h2 style='margin:0'>Safety digest &middot; weekly</h2><div style='color:#666'>{today}</div>"
         f"{body}{err}</div>"
     )
-    text_lines = [f"Safety digest - {today}", ""]
-    for it in blogs + papers:
-        text_lines += [it["title"], f"  {it['source']}", f"  {it['link']}", ""]
+    text_lines = [f"Safety digest (weekly) - {today}", ""]
+    for heading, items in (("READ THESE FIRST", top), ("ALSO WORTH A LOOK", more),
+                           ("TRAINING & METHODS", training)):
+        if items:
+            text_lines += [heading, ""]
+            for it in items:
+                text_lines += [it["title"],
+                               f"  {it['source']} - {it.get('date') or 'date unknown'}",
+                               f"  {it['link']}", f"  {it['summary']}", ""]
     return page, "\n".join(text_lines)
 
 
@@ -444,7 +723,7 @@ def send(page, text, n_items):
     addr = os.environ["EMAIL_ADDRESS"]
     pwd = os.environ["EMAIL_APP_PASSWORD"]
     msg = EmailMessage()
-    msg["Subject"] = f"Safety digest: {n_items} items"
+    msg["Subject"] = f"Safety digest (weekly): {n_items} items"
     msg["From"] = addr
     msg["To"] = addr
     msg.set_content(text)
@@ -459,39 +738,38 @@ def main():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=MAX_AGE_HOURS)
     seen = load_seen()
-    errors = []
+    errors, items = [], []
 
-    blogs = []
     for name, url, always, bonus in FEEDS:
-        blogs += fetch(name, url, always, bonus, False, seen, cutoff, errors)
-
+        items += fetch(name, url, always, bonus, False, seen, cutoff, errors)
     for name, url, link_re, always, bonus in PAGES:
-        blogs += fetch_page_source(name, url, link_re, always, bonus, seen, errors)
+        items += fetch_page_source(name, url, link_re, always, bonus, seen, errors)
 
-    papers = []
     arxiv_urls = [("arXiv", u) for u in arxiv_keyword_urls()] + \
                  [("arXiv (trusted authors)", u) for u in arxiv_author_urls()]
     for i, (name, url) in enumerate(arxiv_urls):
         if i:
-            time.sleep(3)  # be polite to the arXiv API
-        papers += fetch(name, url, False, 0, True, seen, cutoff, errors)
+            time.sleep(5)  # arXiv asks for spacing between API calls
+        items += fetch(name, url, False, 0, True, seen, cutoff, errors, retries=2)
+    items += fetch_hf_papers(seen, now, errors)
 
-    papers += fetch_hf_papers(seen, now, errors)
-
-    blogs = merge(blogs)[:MAX_BLOG_ITEMS]
-    papers = merge(papers)[:MAX_PAPERS]
-
-    page, text = render(blogs, papers, errors)
+    top, more, training, pool = select(items)
+    chosen = top + more + training
+    enrich_descriptions(chosen)
+    page, text = render(top, more, training, errors)
     if dry:
         Path("digest.html").write_text(page)
-        print(f"dry run: {len(blogs)} blog items, {len(papers)} papers, {len(errors)} feed errors")
+        print(f"dry run: {len(top)} top, {len(more)} more, {len(training)} training, "
+              f"{len(pool)} eligible, {len(errors)} feed errors")
         return
 
-    send(page, text, len(blogs) + len(papers))
+    send(page, text, len(chosen))
 
-    for it in blogs + papers:
+    # Everything eligible this week counts as seen: if it didn't make the cut it
+    # shouldn't resurface later as "new".
+    for it in pool:
         seen[it["id"]] = now.isoformat()
-    keep_after = (now - timedelta(days=30)).isoformat()
+    keep_after = (now - timedelta(days=45)).isoformat()
     seen = {k: v for k, v in seen.items() if v >= keep_after}
     SEEN_FILE.write_text(json.dumps(seen, indent=1))
 
