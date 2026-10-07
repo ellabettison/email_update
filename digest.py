@@ -9,11 +9,14 @@ How items are chosen
   relevance : keyword score. Model-psychology terms weigh most, then core safety
               terms. Generic ML terms (RLHF, fine-tuning, "alignment" on its own)
               never make an item eligible by themselves.
-  quality   : source bonus, trusted-author bonus, Hugging Face upvotes (only
-              counted when the item is actually on-topic).
+  quality   : source bonus; for papers an "outside approval" check (trusted
+              author, Hugging Face upvotes, or a link from a trusted blog this
+              month). Keyword relevance is capped so approval outweighs buzzwords.
   recency   : newer items get a ranking bonus; older ones can still win if strong.
-  layout    : "Read these first" (best few), "Also worth a look", and a small
-              "Training & methods" slot for popular training-technique papers.
+  layout    : two balanced sections ("Blogs & newsletters" and "Papers"), each
+              ranked best-first. Papers need outside approval for a main slot; a
+              couple of very strong keyword matches without approval are shown
+              separately as "Unvetted". Plus a small "Training & methods" slot.
 
 Window: every run considers the last 30 days. Only items actually shown are
 marked as seen, so strong near-misses carry over to later weeks and quiet weeks
@@ -38,22 +41,27 @@ from urllib.request import Request, urlopen
 import feedparser
 
 # ---------------------------------------------------------------- config ---
-TOP_PICKS = 5             # "Read these first"
-MAX_MORE = 8              # "Also worth a look"
+POSTS_SHOWN = 7           # "Blogs & newsletters"
+PAPERS_SHOWN = 7          # "Papers"
 MAX_TRAINING = 2          # "Training & methods"
-MAX_PER_SOURCE_TOP = 3    # so one blog can't fill the top section
-MAX_PER_SOURCE_MORE = 4
+MAX_PER_SOURCE = 4        # so one blog can't fill the posts section
 MAX_AGE_HOURS = 30 * 24   # candidate window
 RECENT_DAYS, RECENT_BONUS = 7, 3    # ranking bonus: published in the last week
 MID_DAYS, MID_BONUS = 14, 1         # ... or the last two weeks
 MIN_RELEVANCE = 3         # needed (together with a core term) to be eligible
 AUTHOR_BONUS = 8          # per trusted author on a paper (max 2 counted)
-UPVOTE_STEP = 20          # +1 ranking point per this many HF upvotes ...
-UPVOTE_BONUS_MAX = 4      # ... up to this many, and only if the paper is on-topic
+UPVOTE_STEP = 10          # +1 ranking point per this many HF upvotes ...
+UPVOTE_BONUS_MAX = 6      # ... up to this many, and only if the paper is on-topic
+REL_CAP = 12              # keyword relevance counts for at most this much when ranking
+HF_APPROVAL_UPVOTES = 10  # HF upvotes needed to count as outside approval
+ENDORSE_BONUS = 4         # ranking points per trusted source that links a paper (max 2)
+ENDORSE_MIN_BONUS = 3     # sources with at least this bonus count as trusted endorsers
+UNVETTED_SHOWN = 2        # papers shown without any outside approval ...
+UNVETTED_MIN_REL = 10     # ... but only when their keyword match is very strong
 TRAINING_MIN_UPVOTES = 60 # popular training-technique papers get the small slot
 TRAINING_MIN_SCORE = 3
 HF_LOOKBACK_DAYS = 30
-PAGE_MAX_NEW = 10         # newest N links on a no-feed index page are considered
+PAGE_MAX_NEW = 15         # newest N links on a no-feed index page are considered
 ARXIV_PAGE = 100          # results per arXiv API request
 ARXIV_MAX_PAGES = 4       # pages per keyword query (400 newest matches)
 SEEN_FILE = Path("seen.json")
@@ -78,10 +86,9 @@ FEEDS = [
     ("Redwood Research", "https://blog.redwoodresearch.org/feed", True, 8),
     ("METR", "https://metr.org/feed.xml", True, 8),
     ("AI Safety Newsletter", "https://newsletter.safe.ai/feed", True, 5),
-    ("Import AI", "https://importai.substack.com/feed", True, 4),
+    # Import AI and Zvi (substack.com feeds) return HTTP 403 to GitHub's servers.
     ("Transformer", "https://www.transformernews.ai/feed", True, 4),
     ("Interconnects", "https://www.interconnects.ai/feed", True, 4),
-    ("Zvi", "https://thezvi.substack.com/feed", False, 3),
     ("Raschka", "https://magazine.sebastianraschka.com/feed", False, 2),
     ("Hugging Face blog", "https://huggingface.co/blog/feed.xml", False, 0),
 ]
@@ -96,6 +103,20 @@ PAGES = [
 
 HF_BASE = "https://huggingface.co/api/daily_papers"
 
+# Low-volume, high-signal sources look back further than the 30-day default so
+# a quiet month doesn't hide their best recent posts.
+SOURCE_WINDOW_DAYS = {
+    "Anthropic Alignment Science": 150,
+    "Transformer Circuits": 120,
+    "Redwood Research": 90,
+    "METR": 90,
+    "LessWrong (curated)": 60,
+}
+
+
+def cutoff_for(name, now):
+    return now - timedelta(days=SOURCE_WINDOW_DAYS.get(name, MAX_AGE_HOURS / 24))
+
 # Model psychology / behaviour. Title hit = 6, abstract/body hit = 3.
 PRIORITY_KEYWORDS = [
     "sycophancy", "sycophantic", "persona", "deception", "deceptive", "alignment faking",
@@ -104,7 +125,8 @@ PRIORITY_KEYWORDS = [
     "situational awareness", "evaluation awareness", "model psychology", "model character",
     "character training", "honesty", "persuasion", "role-play", "roleplay", "unfaithful",
     "backdoor", "sleeper agent", "model organism", "lie detector", "lie detection",
-    "manipulative", "user manipulation",
+    "manipulative", "user manipulation", "assistant character", "assistant persona",
+    "persona trait",
 ]
 # Core safety terms. Title hit = 4, abstract/body hit = 2.
 SAFETY_KEYWORDS = [
@@ -178,6 +200,7 @@ def kw_regex(kw):
 PRIORITY_RE = [kw_regex(k) for k in PRIORITY_KEYWORDS]
 SAFETY_RE = [kw_regex(k) for k in SAFETY_KEYWORDS]
 TRAINING_RE = [kw_regex(k) for k in TRAINING_KEYWORDS]
+LLM_RE = re.compile(r"\b(language models?|LLMs?|reasoning models?|chatbots?|AI assistants?)\b", re.I)
 
 
 def norm_name(n):
@@ -194,24 +217,42 @@ def trusted_in(entry):
     return [n for n in names if norm_name(n) in TRUSTED_NORM]
 
 
+def _hits(rxs, kws, title, text, title_w, body_w):
+    out = []
+    for rx, kw in zip(rxs, kws):
+        if rx.search(title):
+            out.append([kw, title_w])
+        elif rx.search(text):
+            out.append([kw, body_w])
+    return out
+
+
+def _merge_overlaps(hits):
+    """'interpretability' inside 'mechanistic interpretability' is one idea: count it once."""
+    for h in hits:
+        for o in hits:
+            if o is h or h[1] is None or o[1] is None or o[0] == h[0]:
+                continue
+            if re.search(r"\b" + re.escape(h[0]) + r"s?\b", o[0]):   # h is part of o
+                o[1] = max(o[1], h[1])
+                h[1] = None
+                break
+    return [h for h in hits if h[1] is not None]
+
+
 def score(title, text):
     """-> (relevance, has_core_term, training_score)."""
-    rel, strong, train = 0, False, 0
-    for rx in PRIORITY_RE:
-        if rx.search(title):
-            rel, strong = rel + 6, True
-        elif rx.search(text):
-            rel, strong = rel + 3, True
-    for rx in SAFETY_RE:
-        if rx.search(title):
-            rel, strong = rel + 4, True
-        elif rx.search(text):
-            rel, strong = rel + 2, True
+    hits = _merge_overlaps(
+        _hits(PRIORITY_RE, PRIORITY_KEYWORDS, title, text, 6, 3)
+        + _hits(SAFETY_RE, SAFETY_KEYWORDS, title, text, 4, 2))
+    rel, strong, train = sum(w for _, w in hits), bool(hits), 0
     for rx in TRAINING_RE:
         if rx.search(title):
             train += 2
         elif rx.search(text):
             train += 1
+    if train and not LLM_RE.search(f"{title} {text}"):
+        train = 0                       # training-technique credit only for LLM work
     return rel, strong, train
 
 
@@ -311,7 +352,7 @@ DATE_META_KEYS = [
 ]
 
 
-def page_date(ap, raw_html, index_nodes, url):
+def page_date(ap, raw_html, index_nodes, url, index_month=""):
     """Best-effort publication date for a page that has no feed. Returns text."""
     for k in DATE_META_KEYS:
         d = parse_date_str(ap.meta.get(k))
@@ -324,6 +365,9 @@ def page_date(ap, raw_html, index_nodes, url):
     m = re.search(r'"datePublished"\s*:\s*"([^"]+)"', raw_html or "")
     if m and parse_date_str(m.group(1)):
         return parse_date_str(m.group(1))
+    d = parse_date_str(index_month)             # month heading above the link on the index
+    if d:
+        return d
     for n in index_nodes:                       # date shown beside the link on the index
         d = parse_date_str(n)
         if d:
@@ -346,6 +390,7 @@ class _LinkMeta(HTMLParser):
         self.paragraphs, self._p = [], None
         self.times = []                          # <time datetime="...">
         self.text_head, self._skip = "", 0       # first ~2500 chars of visible text
+        self._month, self.anchor_month = "", {}  # "July 2026" heading above each link
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -355,6 +400,7 @@ class _LinkMeta(HTMLParser):
             self.links.append(a["href"])
             self._href = a["href"]
             self.anchors.setdefault(self._href, [])
+            self.anchor_month.setdefault(self._href, self._month)
         elif tag == "meta":
             key = (a.get("property") or a.get("name") or "").lower()
             if key and a.get("content"):
@@ -388,6 +434,8 @@ class _LinkMeta(HTMLParser):
         if text:
             if self._href is not None:
                 self.anchors[self._href].append(text)
+            elif re.fullmatch(rf"{_MON_RE}\s+\d{{4}}", text, re.I):
+                self._month = text
             if len(self.text_head) < 2500:
                 self.text_head += text + " "
         if self._p is not None:
@@ -467,6 +515,28 @@ def load_seen():
     return {}
 
 
+ARXIV_LINK_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", re.I)
+ENDORSEMENTS = {}   # arXiv id -> set of trusted source names that link to it
+
+
+def note_endorsements(source, bonus, *texts):
+    if bonus < ENDORSE_MIN_BONUS:
+        return
+    for t in texts:
+        for pid in ARXIV_LINK_RE.findall(t or ""):
+            ENDORSEMENTS.setdefault(pid, set()).add(source)
+
+
+def apply_endorsements(items):
+    for it in items:
+        if it.get("kind") != "paper" or not it["id"].startswith("arxiv:"):
+            continue
+        srcs = sorted(ENDORSEMENTS.get(it["id"][6:], ()))
+        if srcs:
+            it["score"] += ENDORSE_BONUS * min(len(srcs), 2)
+            it["approvals"] = list(it.get("approvals", [])) + [f"cited: {x}" for x in srcs[:2]]
+
+
 def parse_feed(url, retries=0):
     """feedparser with retries, a plain-fetch fallback, and a useful diagnosis."""
     feed, diag = None, ""
@@ -499,12 +569,15 @@ def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
             m = re.search(r"arxiv\.org/abs/(.+?)(?:v\d+)?$", uid)
             if m:
                 uid = "arxiv:" + m.group(1)  # same id as the Hugging Face source
-        if not uid or uid in seen:
-            continue
         when = entry_time(e)
         if when and when < cutoff:
             continue
         raw = e.get("summary") or e.get("description")
+        if not is_paper:      # note which arXiv papers trusted sources link to
+            blob = (raw or "") + " ".join(c.get("value", "") for c in (e.get("content") or []))
+            note_endorsements(name, bonus, blob)
+        if not uid or uid in seen:
+            continue
         title = clean_title(clean(e.get("title"), 200), e.get("link", ""))
         # Some feeds (LessWrong) ship the whole post: score the opening ~1500
         # chars, but only show 320.
@@ -516,9 +589,11 @@ def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
         extra = AUTHOR_BONUS * min(len(trusted), 2) if is_paper else bonus
         items.append({
             "id": uid, "source": name, "title": title, "summary": clean(raw, 320),
-            "link": e.get("link", uid), "score": rel + min(train, 3) + extra,
-            "strong": strong, "training_only": training_only, "trusted": trusted,
+            "link": e.get("link", uid), "score": min(rel, REL_CAP) + min(train, 3) + extra,
+            "rel": rel, "strong": strong, "training_only": training_only,
+            "trusted": trusted, "approvals": ["author"] if trusted else [],
             "upvotes": None, "date": fmt_date(when), "when": when,
+            "kind": "paper" if is_paper else "post",
         })
     return items
 
@@ -586,9 +661,10 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cut
         time.sleep(1)
         ap = _LinkMeta()
         ap.feed(art)
+        note_endorsements(name, bonus, art)
         title = clean_title(clean(ap.meta.get("og:title") or ap.title, 200), full)
         nodes = p.anchors.get(href, [])
-        date = page_date(ap, art, nodes, full)
+        date = page_date(ap, art, nodes, full, p.anchor_month.get(href, ""))
         when = display_to_datetime(date)
         if cutoff and when and when < cutoff:
             continue
@@ -604,9 +680,10 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cut
             continue
         items.append({
             "id": nid, "source": name, "title": title, "summary": clean(desc, 320),
-            "link": full, "score": rel + min(train, 3) + bonus, "strong": strong,
+            "link": full, "score": min(rel, REL_CAP) + min(train, 3) + bonus, "rel": rel,
+            "approvals": [], "strong": strong,
             "training_only": training_only, "trusted": [], "upvotes": None,
-            "date": date, "when": when,
+            "date": date, "when": when, "kind": "post",
         })
     return items
 
@@ -684,12 +761,14 @@ def fetch_hf_papers(seen, now, errors):
         bonus = AUTHOR_BONUS * min(len(trusted), 2)
         if strong:
             bonus += min(upv // UPVOTE_STEP, UPVOTE_BONUS_MAX)
+        approvals = (["author"] if trusted else []) + (["hf"] if upv >= HF_APPROVAL_UPVOTES else [])
         items.append({
             "id": f"arxiv:{pid}", "source": "Hugging Face daily papers",
             "title": title, "summary": clean(abstract, 320),
-            "link": f"https://arxiv.org/abs/{pid}", "score": rel + min(train, 3) + bonus,
+            "link": f"https://arxiv.org/abs/{pid}",
+            "score": min(rel, REL_CAP) + min(train, 3) + bonus, "rel": rel,
             "strong": strong, "training_only": training_only, "trusted": trusted,
-            "upvotes": upv, "when": when,
+            "approvals": approvals, "upvotes": upv, "when": when, "kind": "paper",
             "date": fmt_date(parse_iso(row.get("publishedAt")) or when),
         })
     return items
@@ -697,12 +776,21 @@ def fetch_hf_papers(seen, now, errors):
 
 # -------------------------------------------------------------- selection ---
 def merge(items):
-    """Same post can arrive via several feeds/queries; keep the best-scored."""
+    """Same paper/post can arrive via several feeds or queries: keep the
+    best-scored copy but pool the approvals, trusted authors and upvotes."""
     best = {}
     for it in items:
         cur = best.get(it["id"])
-        if cur is None or it["score"] > cur["score"]:
+        if cur is None:
             best[it["id"]] = it
+            continue
+        win, lose = (it, cur) if it["score"] > cur["score"] else (cur, it)
+        m = dict(win)
+        m["approvals"] = sorted(set(win.get("approvals", [])) | set(lose.get("approvals", [])))
+        m["trusted"] = list(dict.fromkeys(list(win["trusted"]) + list(lose["trusted"])))
+        ups = [u for u in (win.get("upvotes"), lose.get("upvotes")) if u]
+        m["upvotes"] = max(ups) if ups else None
+        best[it["id"]] = m
     return sorted(best.values(), key=lambda x: x["score"], reverse=True)
 
 
@@ -737,17 +825,22 @@ def select(items, now=None):
     for it in pool:
         it["rank"] = it["score"] + recency_bonus(it.get("when"), now)
     pool.sort(key=lambda x: x["rank"], reverse=True)
-    top = take([i for i in pool if i["strong"] and not i["training_only"]],
-               TOP_PICKS, MAX_PER_SOURCE_TOP)
-    used = {i["id"] for i in top}
-    rest = [i for i in pool if i["id"] not in used]
-    more = take([i for i in rest if not i["training_only"]], MAX_MORE, MAX_PER_SOURCE_MORE)
-    training = take([i for i in rest if i["training_only"]], MAX_TRAINING, MAX_TRAINING)
-    return top, more, training, pool
+    live = [i for i in pool if not i["training_only"]]
+    paper = lambda i: i.get("kind") == "paper"
+    posts = take([i for i in live if not paper(i)], POSTS_SHOWN, MAX_PER_SOURCE)
+    spare = min(POSTS_SHOWN - len(posts), 3)   # a thin week of posts frees a few paper slots
+    n = PAPERS_SHOWN + spare
+    # A main paper slot needs outside approval; strong keyword matches without
+    # any approval go in a small, clearly labelled extra section.
+    papers = take([i for i in live if paper(i) and i.get("approvals")], n, n)
+    unvetted = take([i for i in live if paper(i) and not i.get("approvals")
+                     and i.get("rel", 0) >= UNVETTED_MIN_REL], UNVETTED_SHOWN, UNVETTED_SHOWN)
+    training = take([i for i in pool if i["training_only"]], MAX_TRAINING, MAX_TRAINING)
+    return posts, papers, unvetted, training, pool
 
 
 # ----------------------------------------------------------------- output ---
-def render(top, more, training, errors):
+def render(posts, papers, unvetted, training, errors):
     today = datetime.now(timezone.utc).strftime("%a %d %b %Y")
 
     def item_html(it, n):
@@ -757,6 +850,10 @@ def render(top, more, training, errors):
                      + html.escape(", ".join(it["trusted"][:3])) + "</span>")
         if it.get("upvotes"):
             badge += f" &middot; <span style='color:#555'>&#9650; {it['upvotes']}</span>"
+        cited = [a[7:] for a in it.get("approvals", []) if a.startswith("cited: ")]
+        if cited:
+            badge += (" &middot; <span style='color:#2a6'>cited by "
+                      + html.escape(", ".join(cited)) + "</span>")
         date_html = (f" &middot; {html.escape(it['date'])}" if it.get("date")
                      else " &middot; <span style='color:#999'>date unknown</span>")
         return (
@@ -768,14 +865,18 @@ def render(top, more, training, errors):
             "</div>"
         )
 
-    def block(heading, items, n):
+    def block(heading, items, n, note=""):
         if not items:
             return ""
-        return (f"<h3 style='margin:26px 0 8px'>{heading}</h3>"
+        note_html = f"<div style='color:#888;font-size:12px;margin:-4px 0 10px'>{note}</div>" if note else ""
+        return (f"<h3 style='margin:26px 0 8px'>{heading}</h3>" + note_html
                 + "".join(item_html(i, n) for i in items))
 
-    body = (block("Read these first", top, 320)
-            + block("Also worth a look", more, 200)
+    body = (block("Blogs &amp; newsletters", posts, 300)
+            + block("Papers", papers, 300)
+            + block("Unvetted papers", unvetted, 240,
+                    "Strong keyword match, but no trusted author, Hugging Face upvotes, "
+                    "or link from a trusted source (yet).")
             + block("Training &amp; methods", training, 180))
     if not body:
         body = "<p>Nothing new matched this week.</p>"
@@ -789,7 +890,8 @@ def render(top, more, training, errors):
         f"{body}{err}</div>"
     )
     text_lines = [f"Safety digest (weekly) - {today}", ""]
-    for heading, items in (("READ THESE FIRST", top), ("ALSO WORTH A LOOK", more),
+    for heading, items in (("BLOGS & NEWSLETTERS", posts), ("PAPERS", papers),
+                           ("UNVETTED PAPERS (no outside approval yet)", unvetted),
                            ("TRAINING & METHODS", training)):
         if items:
             text_lines += [heading, ""]
@@ -819,12 +921,14 @@ def main():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=MAX_AGE_HOURS)
     seen = load_seen()
+    ENDORSEMENTS.clear()
     errors, items = [], []
 
     for name, url, always, bonus in FEEDS:
-        items += fetch(name, url, always, bonus, False, seen, cutoff, errors)
+        items += fetch(name, url, always, bonus, False, seen, cutoff_for(name, now), errors)
     for name, url, link_re, always, bonus in PAGES:
-        items += fetch_page_source(name, url, link_re, always, bonus, seen, errors, cutoff)
+        items += fetch_page_source(name, url, link_re, always, bonus, seen, errors,
+                                   cutoff_for(name, now))
 
     jobs = [("arXiv", u, ARXIV_MAX_PAGES) for u in arxiv_keyword_urls()] + \
            [("arXiv (trusted authors)", u, 3) for u in arxiv_author_urls()]
@@ -840,20 +944,21 @@ def main():
             break
     items += fetch_hf_papers(seen, now, errors)
 
-    top, more, training, pool = select(items, now)
-    chosen = top + more + training
+    apply_endorsements(items)
+    posts, papers, unvetted, training, pool = select(items, now)
+    chosen = posts + papers + unvetted + training
     enrich_descriptions(chosen)
-    page, text = render(top, more, training, errors)
+    page, text = render(posts, papers, unvetted, training, errors)
     if dry:
         Path("digest.html").write_text(page)
-        print(f"dry run: {len(top)} top, {len(more)} more, {len(training)} training, "
+        print(f"dry run: {len(posts)} posts, {len(papers)} papers, {len(unvetted)} unvetted, {len(training)} training, "
               f"{len(pool)} eligible in window, {len(errors)} feed errors")
         return
 
     send(page, text, len(chosen))
 
-    # Only what was actually shown counts as seen; strong near-misses stay
-    # eligible (until they age out of the 30-day window) and carry over.
+    # Only what was actually shown counts as seen; near-misses stay eligible
+    # until they age out of their window and carry over to later weeks.
     for it in chosen:
         seen[it["id"]] = now.isoformat()
     keep_after = (now - timedelta(days=180)).isoformat()
@@ -863,4 +968,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
