@@ -16,7 +16,8 @@ How items are chosen
   layout    : two balanced sections ("Blogs & newsletters" and "Papers"), each
               ranked best-first. Papers need outside approval for a main slot; a
               couple of very strong keyword matches without approval are shown
-              separately as "Unvetted". Plus a small "Training & methods" slot.
+              separately as "Unvetted". Plus a small "Training & methods" slot and
+              a "General AI" section for important non-safety papers/posts.
 
 Window: every run considers the last 30 days. Only items actually shown are
 marked as seen, so strong near-misses carry over to later weeks and quiet weeks
@@ -36,14 +37,24 @@ from email.message import EmailMessage
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import quote, urljoin
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import feedparser
 
 # ---------------------------------------------------------------- config ---
+POST_RECENT = ((7, 6), (14, 4), (30, 2))   # (max age in days, ranking bonus) for posts
+POSTS_OLD_DAYS = 30       # a post older than this counts as "old" ...
+POSTS_OLD_MAX = 2         # ... and at most this many old posts per email
+MAX_PER_AUTHOR = 2        # at most this many main papers per trusted author
+CITED_MAX_IDS = 40        # papers linked by trusted sources that we look up directly
+CITED_MAX_AGE_MONTHS = 2  # ... only if their arXiv id is this recent
+CITED_WINDOW_DAYS = 45
+CITED_BASE_SCORE = 8      # ranking base for an off-topic paper a trusted source links to
+PAPER_BUDGET = 10         # hard cap on papers per email, across ALL paper sections
 POSTS_SHOWN = 7           # "Blogs & newsletters"
-PAPERS_SHOWN = 7          # "Papers"
-MAX_TRAINING = 2          # "Training & methods"
+PAPERS_SHOWN = 6   # "Papers" (outside-approved)
+MAX_TRAINING = 1   # "Training & methods"
 MAX_PER_SOURCE = 4        # so one blog can't fill the posts section
 MAX_AGE_HOURS = 30 * 24   # candidate window
 RECENT_DAYS, RECENT_BONUS = 7, 3    # ranking bonus: published in the last week
@@ -56,14 +67,23 @@ REL_CAP = 12              # keyword relevance counts for at most this much when 
 HF_APPROVAL_UPVOTES = 10  # HF upvotes needed to count as outside approval
 ENDORSE_BONUS = 4         # ranking points per trusted source that links a paper (max 2)
 ENDORSE_MIN_BONUS = 3     # sources with at least this bonus count as trusted endorsers
-UNVETTED_SHOWN = 2        # papers shown without any outside approval ...
+ON_TOPIC_REL = 6          # relevance needed for HF upvotes to count as approval (or a core term in the title)
+GENERAL_MIN_UPVOTES = 100 # popular papers on ANY AI topic qualify for "General AI"
+GENERAL_PAPERS = 2   # "General AI" papers
+GENERAL_POSTS = 2
+# Major AI blogs/newsletters whose non-safety posts can appear under "General AI".
+GENERAL_SOURCES = {"Interconnects", "Transformer", "Anthropic Research", "Google DeepMind",
+                   "OpenAI Research", "Hugging Face blog", "Raschka"}
+UNVETTED_SHOWN = 1   # papers shown without any outside approval ...
 UNVETTED_MIN_REL = 10     # ... but only when their keyword match is very strong
-TRAINING_MIN_UPVOTES = 60 # popular training-technique papers get the small slot
+TRAINING_MIN_UPVOTES = 100 # popular training-technique papers get the small slot
 TRAINING_MIN_SCORE = 3
 HF_LOOKBACK_DAYS = 30
 PAGE_MAX_NEW = 15         # newest N links on a no-feed index page are considered
 ARXIV_PAGE = 100          # results per arXiv API request
-ARXIV_MAX_PAGES = 4       # pages per keyword query (400 newest matches)
+ARXIV_MAX_PAGES = 3       # pages per keyword query (300 newest matches)
+ARXIV_GAP = 10            # seconds between arXiv API requests (it rate-limits shared IPs)
+ARXIV_BUDGET_SECONDS = 900  # give up on arXiv after this long in total
 SEEN_FILE = Path("seen.json")
 UA = "Mozilla/5.0 (compatible; safety-digest/1.0; personal feed reader)"
 
@@ -89,7 +109,7 @@ FEEDS = [
     # Import AI and Zvi (substack.com feeds) return HTTP 403 to GitHub's servers.
     ("Transformer", "https://www.transformernews.ai/feed", True, 4),
     ("Interconnects", "https://www.interconnects.ai/feed", True, 4),
-    ("Raschka", "https://magazine.sebastianraschka.com/feed", False, 2),
+    ("Raschka", "https://magazine.sebastianraschka.com/feed", False, 3),   # bonus 3: his links count as endorsements
     ("Hugging Face blog", "https://huggingface.co/blog/feed.xml", False, 0),
 ]
 
@@ -497,7 +517,7 @@ def arxiv_keyword_urls(chunk=19):
     return urls
 
 
-def arxiv_author_urls(chunk=20):
+def arxiv_author_urls(chunk=30):
     cats = " OR ".join(f"cat:{c}" for c in ARXIV_CATEGORIES)
     urls = []
     for i in range(0, len(TRUSTED_AUTHORS), chunk):
@@ -513,6 +533,14 @@ def load_seen():
         except json.JSONDecodeError:
             pass
     return {}
+
+
+STATS = {}   # source -> counts for the "source check" footer
+
+
+def stat(source, key, n=1):
+    d = STATS.setdefault(source, {"fetched": 0, "window": 0, "eligible": 0})
+    d[key] += n
 
 
 ARXIV_LINK_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", re.I)
@@ -569,9 +597,11 @@ def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
             m = re.search(r"arxiv\.org/abs/(.+?)(?:v\d+)?$", uid)
             if m:
                 uid = "arxiv:" + m.group(1)  # same id as the Hugging Face source
+        stat(name, "fetched")
         when = entry_time(e)
         if when and when < cutoff:
             continue
+        stat(name, "window")
         raw = e.get("summary") or e.get("description")
         if not is_paper:      # note which arXiv papers trusted sources link to
             blob = (raw or "") + " ".join(c.get("value", "") for c in (e.get("content") or []))
@@ -584,13 +614,17 @@ def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
         rel, strong, train = score(title, clean(raw, 1500))
         trusted = trusted_in(e) if is_paper else []
         ok, training_only = judge(rel, strong, train, always, bool(trusted))
+        general = False
+        if name in GENERAL_SOURCES and not is_paper and not (strong and rel >= MIN_RELEVANCE):
+            ok, general = True, True     # not safety-specific: "General AI" candidate
         if not ok:
             continue
         extra = AUTHOR_BONUS * min(len(trusted), 2) if is_paper else bonus
+        stat(name, "eligible")
         items.append({
             "id": uid, "source": name, "title": title, "summary": clean(raw, 320),
             "link": e.get("link", uid), "score": min(rel, REL_CAP) + min(train, 3) + extra,
-            "rel": rel, "strong": strong, "training_only": training_only,
+            "rel": rel, "strong": strong, "training_only": training_only, "general": general,
             "trusted": trusted, "approvals": ["author"] if trusted else [],
             "upvotes": None, "date": fmt_date(when), "when": when,
             "kind": "paper" if is_paper else "post",
@@ -610,19 +644,40 @@ def fetch(name, url, always, bonus, is_paper, seen, cutoff, errors, retries=0):
     return entries_to_items(feed.entries, name, always, bonus, is_paper, seen, cutoff)
 
 
-def fetch_arxiv(name, url, seen, cutoff, errors, max_pages):
-    """Page back through an arXiv API query until it is older than the cutoff.
-    Returns (items, first_page_ok)."""
+def arxiv_parse(url, deadline):
+    """Fetch one arXiv API page, backing off on 429/503/timeouts.
+    -> (feed, "") on success (possibly zero entries), (None, diagnosis) on failure."""
+    waits, diag = [20, 45, 90], ""
+    for attempt in range(len(waits) + 1):
+        wait = None
+        try:
+            with urlopen(Request(url, headers={"User-Agent": UA}), timeout=60) as r:
+                return feedparser.parse(r.read()), ""
+        except HTTPError as exc:
+            diag = f"HTTP {exc.code}"
+            ra = exc.headers.get("Retry-After") if exc.headers else None
+            wait = int(ra) if ra and str(ra).isdigit() else None
+        except Exception as exc:
+            diag = f"{type(exc).__name__}: {str(exc)[:80]}"
+        if attempt == len(waits) or time.time() > deadline:
+            break
+        time.sleep(min(wait or waits[attempt], 120))
+    return None, diag
+
+
+def fetch_arxiv(name, url, seen, cutoff, errors, max_pages, deadline):
+    """Page back through an arXiv API query until results pass the cutoff.
+    Returns (items, ok)."""
     items = []
     for page in range(max_pages):
         if page:
-            time.sleep(5)               # arXiv asks for spacing between calls
-        feed, diag = parse_feed(f"{url}&start={page * ARXIV_PAGE}", retries=2)
+            time.sleep(ARXIV_GAP)
+        feed, diag = arxiv_parse(f"{url}&start={page * ARXIV_PAGE}", deadline)
+        if feed is None:
+            errors.append(f"{name}: failed after retries ({diag}) - {url[:100]}")
+            return items, page > 0           # earlier pages still count
         if not feed.entries:
-            if page == 0:
-                errors.append(f"{name}: no entries ({diag}) - {url[:110]}")
-                return items, False
-            break
+            break                            # an empty result is not an error
         items += entries_to_items(feed.entries, name, False, 0, True, seen, cutoff)
         times = [t for t in (entry_time(e) for e in feed.entries) if t]
         if len(feed.entries) < ARXIV_PAGE or (times and min(times) < cutoff):
@@ -649,6 +704,7 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cut
     if not found:
         errors.append(f"{name}: no article links matched on {index_url} (site layout changed?)")
         return []
+    stat(name, "fetched", len(found))
     items = []
     # Only the newest PAGE_MAX_NEW links are ever considered, so older posts
     # can never trickle in one batch at a time.
@@ -668,6 +724,7 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cut
         when = display_to_datetime(date)
         if cutoff and when and when < cutoff:
             continue
+        stat(name, "window")
         # description: page meta -> blurb on the index page -> first real paragraph
         desc = ap.meta.get("og:description") or ap.meta.get("description") or ""
         if len(clean(desc)) < 40:
@@ -678,6 +735,7 @@ def fetch_page_source(name, index_url, link_re, always, bonus, seen, errors, cut
         ok, training_only = judge(rel, strong, train, always)
         if not ok:
             continue
+        stat(name, "eligible")
         items.append({
             "id": nid, "source": name, "title": title, "summary": clean(desc, 320),
             "link": full, "score": min(rel, REL_CAP) + min(train, 3) + bonus, "rel": rel,
@@ -746,9 +804,11 @@ def fetch_hf_papers(seen, now, errors):
         if not pid or pid in done or f"arxiv:{pid}" in seen:
             continue
         done.add(pid)
+        stat("Hugging Face daily papers", "fetched")
         when = parse_iso(p.get("submittedOnDailyAt") or row.get("publishedAt"))
         if when and when < cutoff:
             continue
+        stat("Hugging Face daily papers", "window")
         title = clean_title(clean(p.get("title") or row.get("title"), 200))
         abstract = clean(p.get("summary") or row.get("summary"), 1500)
         upv = p.get("upvotes") or 0
@@ -756,25 +816,87 @@ def fetch_hf_papers(seen, now, errors):
                    if norm_name(a.get("name", "")) in TRUSTED_NORM]
         rel, strong, train = score(title, abstract)
         ok, training_only = judge(rel, strong, train, False, bool(trusted), upv)
+        # Upvotes only count as approval for papers that are really on-topic:
+        # a core term in the title, or a strong overall keyword match.
+        topical = rel >= ON_TOPIC_REL or score(title, "")[1]
+        general = False
+        if upv >= GENERAL_MIN_UPVOTES and not topical and not training_only and not trusted:
+            ok, general = True, True        # popular, but not safety-specific
         if not ok:
             continue
         bonus = AUTHOR_BONUS * min(len(trusted), 2)
-        if strong:
+        if topical:
             bonus += min(upv // UPVOTE_STEP, UPVOTE_BONUS_MAX)
-        approvals = (["author"] if trusted else []) + (["hf"] if upv >= HF_APPROVAL_UPVOTES else [])
+        approvals = (["author"] if trusted else []) + \
+                    (["hf"] if upv >= HF_APPROVAL_UPVOTES and topical else [])
+        stat("Hugging Face daily papers", "eligible")
+        total = min(upv // 20, 15) if general else min(rel, REL_CAP) + min(train, 3) + bonus
         items.append({
             "id": f"arxiv:{pid}", "source": "Hugging Face daily papers",
             "title": title, "summary": clean(abstract, 320),
-            "link": f"https://arxiv.org/abs/{pid}",
-            "score": min(rel, REL_CAP) + min(train, 3) + bonus, "rel": rel,
-            "strong": strong, "training_only": training_only, "trusted": trusted,
-            "approvals": approvals, "upvotes": upv, "when": when, "kind": "paper",
+            "link": f"https://arxiv.org/abs/{pid}", "score": total, "rel": rel,
+            "strong": strong, "training_only": training_only, "general": general,
+            "trusted": trusted, "approvals": approvals, "upvotes": upv, "when": when,
+            "kind": "paper",
             "date": fmt_date(parse_iso(row.get("publishedAt")) or when),
         })
     return items
 
 
 # -------------------------------------------------------------- selection ---
+def fetch_cited_papers(items, seen, now, errors, deadline):
+    """Look up recent arXiv papers that trusted sources link to but that our own
+    queries didn't fetch. On-topic ones become ordinary papers (approved via the
+    citation); everything else becomes a "General AI" candidate. This is how an
+    important paper outside the safety keywords (e.g. a new training paradigm)
+    reaches you when Interconnects, Transformer, Redwood, LessWrong etc. discuss it."""
+    have = {i["id"] for i in items}
+    idx_now = (now.year % 100) * 12 + now.month
+    ids = []
+    for pid in sorted(ENDORSEMENTS, reverse=True):               # newest ids first
+        if f"arxiv:{pid}" in seen or f"arxiv:{pid}" in have:
+            continue
+        idx = int(pid[:2]) * 12 + int(pid[2:4])
+        if 0 <= idx_now - idx <= CITED_MAX_AGE_MONTHS:
+            ids.append(pid)
+    ids = ids[:CITED_MAX_IDS]
+    out, cutoff, src = [], now - timedelta(days=CITED_WINDOW_DAYS), "arXiv (cited by trusted sources)"
+    for i in range(0, len(ids), 20):
+        if i:
+            time.sleep(ARXIV_GAP)
+        url = "https://export.arxiv.org/api/query?id_list=" + ",".join(ids[i:i + 20]) + "&max_results=20"
+        feed, diag = arxiv_parse(url, deadline)
+        if feed is None:
+            errors.append(f"{src}: failed ({diag})")
+            break
+        for e in feed.entries:
+            m = re.search(r"arxiv\.org/abs/(.+?)(?:v\d+)?$", e.get("id") or "")
+            if not m:
+                continue                                          # arXiv error entries
+            stat(src, "fetched")
+            when = entry_time(e)
+            if when and when < cutoff:
+                continue
+            stat(src, "window")
+            title = clean_title(clean(e.get("title"), 200), e.get("link", ""))
+            raw = e.get("summary")
+            rel, strong, train = score(title, clean(raw, 1500))
+            trusted = trusted_in(e)
+            ok, _ = judge(rel, strong, train, False, bool(trusted))
+            topical = ok and (rel >= ON_TOPIC_REL or score(title, "")[1])
+            stat(src, "eligible")
+            out.append({
+                "id": "arxiv:" + m.group(1), "source": src, "title": title,
+                "summary": clean(raw, 320), "link": e.get("link", ""), "rel": rel,
+                "score": (min(rel, REL_CAP) + AUTHOR_BONUS * min(len(trusted), 2)) if topical
+                         else CITED_BASE_SCORE,
+                "strong": strong, "training_only": False, "general": not topical,
+                "trusted": trusted, "approvals": ["author"] if trusted else [],
+                "upvotes": None, "date": fmt_date(when), "when": when, "kind": "paper",
+            })
+    return out
+
+
 def merge(items):
     """Same paper/post can arrive via several feeds or queries: keep the
     best-scored copy but pool the approvals, trusted authors and upvotes."""
@@ -790,6 +912,7 @@ def merge(items):
         m["trusted"] = list(dict.fromkeys(list(win["trusted"]) + list(lose["trusted"])))
         ups = [u for u in (win.get("upvotes"), lose.get("upvotes")) if u]
         m["upvotes"] = max(ups) if ups else None
+        m["general"] = bool(win.get("general") and lose.get("general"))
         best[it["id"]] = m
     return sorted(best.values(), key=lambda x: x["score"], reverse=True)
 
@@ -806,12 +929,17 @@ def take(items, n, per_source):
     return out
 
 
-def recency_bonus(when, now):
+def recency_bonus(when, now, kind="paper"):
     if not when:
         return 0
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     age = now - when
+    if kind != "paper":                       # posts: recency matters more
+        for days, bonus in POST_RECENT:
+            if age <= timedelta(days=days):
+                return bonus
+        return 0
     if age <= timedelta(days=RECENT_DAYS):
         return RECENT_BONUS
     if age <= timedelta(days=MID_DAYS):
@@ -819,28 +947,83 @@ def recency_bonus(when, now):
     return 0
 
 
+def take_posts(items, n, per_source, now):
+    """Like take(), but at most POSTS_OLD_MAX posts older than POSTS_OLD_DAYS."""
+    out, counts, old = [], {}, 0
+    for it in items:
+        if len(out) >= n:
+            break
+        if counts.get(it["source"], 0) >= per_source:
+            continue
+        w = it.get("when")
+        if w and w.tzinfo is None:
+            w = w.replace(tzinfo=timezone.utc)
+        is_old = bool(w) and (now - w) > timedelta(days=POSTS_OLD_DAYS)
+        if is_old and old >= POSTS_OLD_MAX:
+            continue
+        old += is_old
+        counts[it["source"]] = counts.get(it["source"], 0) + 1
+        out.append(it)
+    return out
+
+
+def take_authors(items, per_author):
+    """No more than per_author papers by the same trusted author."""
+    out, used = [], {}
+    for it in items:
+        if any(used.get(a, 0) >= per_author for a in it["trusted"]):
+            continue
+        for a in it["trusted"]:
+            used[a] = used.get(a, 0) + 1
+        out.append(it)
+    return out
+
+
 def select(items, now=None):
     now = now or datetime.now(timezone.utc)
     pool = merge(items)
     for it in pool:
-        it["rank"] = it["score"] + recency_bonus(it.get("when"), now)
+        it["rank"] = it["score"] + recency_bonus(it.get("when"), now, it.get("kind"))
     pool.sort(key=lambda x: x["rank"], reverse=True)
-    live = [i for i in pool if not i["training_only"]]
+    live = [i for i in pool if not i["training_only"] and not i.get("general")]
     paper = lambda i: i.get("kind") == "paper"
-    posts = take([i for i in live if not paper(i)], POSTS_SHOWN, MAX_PER_SOURCE)
-    spare = min(POSTS_SHOWN - len(posts), 3)   # a thin week of posts frees a few paper slots
-    n = PAPERS_SHOWN + spare
+    gen = [i for i in pool if i.get("general") and not i["training_only"]]
+    posts = take_posts([i for i in live if not paper(i)], POSTS_SHOWN, MAX_PER_SOURCE, now)
+
+    # Papers share one budget (PAPER_BUDGET) across four sections. Each section
+    # has a quota; slots a section can't fill flow to the next, most trusted first.
     # A main paper slot needs outside approval; strong keyword matches without
     # any approval go in a small, clearly labelled extra section.
-    papers = take([i for i in live if paper(i) and i.get("approvals")], n, n)
-    unvetted = take([i for i in live if paper(i) and not i.get("approvals")
-                     and i.get("rel", 0) >= UNVETTED_MIN_REL], UNVETTED_SHOWN, UNVETTED_SHOWN)
-    training = take([i for i in pool if i["training_only"]], MAX_TRAINING, MAX_TRAINING)
-    return posts, papers, unvetted, training, pool
+    cands = {
+        "papers": take_authors([i for i in live if paper(i) and i.get("approvals")], MAX_PER_AUTHOR),
+        "unvetted": [i for i in live if paper(i) and not i.get("approvals")
+                     and i.get("rel", 0) >= UNVETTED_MIN_REL],
+        "general": [i for i in gen if paper(i)],
+        "training": [i for i in pool if i["training_only"]],
+    }
+    quota = {"papers": PAPERS_SHOWN, "unvetted": UNVETTED_SHOWN,
+             "general": GENERAL_PAPERS, "training": MAX_TRAINING}
+    chosen = {k: cands[k][:quota[k]] for k in cands}
+    spare = PAPER_BUDGET - sum(len(v) for v in chosen.values())
+    for k in ("papers", "general", "training", "unvetted"):
+        if spare <= 0:
+            break
+        extra = cands[k][len(chosen[k]):len(chosen[k]) + spare]
+        chosen[k] += extra
+        spare -= len(extra)
+    over = sum(len(v) for v in chosen.values()) - PAPER_BUDGET
+    for k in ("unvetted", "training", "general", "papers"):   # trim if quotas were set too high
+        while over > 0 and chosen[k]:
+            chosen[k].pop()
+            over -= 1
+
+    gen_posts = take([i for i in gen if not paper(i)], GENERAL_POSTS, GENERAL_POSTS)
+    general = sorted(chosen["general"] + gen_posts, key=lambda x: x["rank"], reverse=True)
+    return posts, chosen["papers"], chosen["unvetted"], general, chosen["training"], pool
 
 
 # ----------------------------------------------------------------- output ---
-def render(posts, papers, unvetted, training, errors):
+def render(posts, papers, unvetted, general, training, errors, stats=None):
     today = datetime.now(timezone.utc).strftime("%a %d %b %Y")
 
     def item_html(it, n):
@@ -877,6 +1060,9 @@ def render(posts, papers, unvetted, training, errors):
             + block("Unvetted papers", unvetted, 240,
                     "Strong keyword match, but no trusted author, Hugging Face upvotes, "
                     "or link from a trusted source (yet).")
+            + block("General AI worth knowing", general, 240,
+                    "Not safety-specific: picked for popularity (100+ Hugging Face upvotes) "
+                    "or because it's from a major AI blog or newsletter.")
             + block("Training &amp; methods", training, 180))
     if not body:
         body = "<p>Nothing new matched this week.</p>"
@@ -884,14 +1070,20 @@ def render(posts, papers, unvetted, training, errors):
     if errors:
         err = ("<hr><p style='color:#a00;font-size:12px'>Feed problems:<br>"
                + "<br>".join(html.escape(x) for x in errors) + "</p>")
+    stats_html = ""
+    if stats:
+        stats_html = ("<hr><div style='color:#888;font-size:11px'>Source check "
+                      "(fetched &middot; in window &middot; eligible &middot; shown):<br>"
+                      + "<br>".join(html.escape(x) for x in stats) + "</div>")
     page = (
         "<div style='font-family:-apple-system,Segoe UI,sans-serif;max-width:640px'>"
         f"<h2 style='margin:0'>Safety digest &middot; weekly</h2><div style='color:#666'>{today}</div>"
-        f"{body}{err}</div>"
+        f"{body}{err}{stats_html}</div>"
     )
     text_lines = [f"Safety digest (weekly) - {today}", ""]
     for heading, items in (("BLOGS & NEWSLETTERS", posts), ("PAPERS", papers),
                            ("UNVETTED PAPERS (no outside approval yet)", unvetted),
+                           ("GENERAL AI WORTH KNOWING", general),
                            ("TRAINING & METHODS", training)):
         if items:
             text_lines += [heading, ""]
@@ -922,6 +1114,7 @@ def main():
     cutoff = now - timedelta(hours=MAX_AGE_HOURS)
     seen = load_seen()
     ENDORSEMENTS.clear()
+    STATS.clear()
     errors, items = [], []
 
     for name, url, always, bonus in FEEDS:
@@ -930,28 +1123,41 @@ def main():
         items += fetch_page_source(name, url, link_re, always, bonus, seen, errors,
                                    cutoff_for(name, now))
 
-    jobs = [("arXiv", u, ARXIV_MAX_PAGES) for u in arxiv_keyword_urls()] + \
-           [("arXiv (trusted authors)", u, 3) for u in arxiv_author_urls()]
+    # Trusted-author queries first (fewest requests, most valuable), then keywords.
+    deadline = time.time() + ARXIV_BUDGET_SECONDS
+    jobs = [("arXiv (trusted authors)", u, 2) for u in arxiv_author_urls()] + \
+           [("arXiv", u, ARXIV_MAX_PAGES) for u in arxiv_keyword_urls()]
     failed_in_a_row = 0
     for i, (name, url, pages) in enumerate(jobs):
+        if time.time() > deadline:
+            errors.append("arXiv: time budget used up, remaining queries skipped")
+            break
         if i:
-            time.sleep(5)
-        got, ok = fetch_arxiv(name, url, seen, cutoff, errors, pages)
+            time.sleep(ARXIV_GAP)
+        got, ok = fetch_arxiv(name, url, seen, cutoff, errors, pages, deadline)
         items += got
         failed_in_a_row = 0 if ok else failed_in_a_row + 1
-        if failed_in_a_row >= 2:
-            errors.append("arXiv: two queries in a row failed, skipping the rest this run")
+        if failed_in_a_row >= 3:
+            errors.append("arXiv: three queries in a row failed, remaining skipped")
             break
     items += fetch_hf_papers(seen, now, errors)
+    if failed_in_a_row < 3 and time.time() < deadline:
+        time.sleep(ARXIV_GAP)
+        items += fetch_cited_papers(items, seen, now, errors, deadline)
 
     apply_endorsements(items)
-    posts, papers, unvetted, training, pool = select(items, now)
-    chosen = posts + papers + unvetted + training
+    posts, papers, unvetted, general, training, pool = select(items, now)
+    chosen = posts + papers + unvetted + general + training
     enrich_descriptions(chosen)
-    page, text = render(posts, papers, unvetted, training, errors)
+    shown = {}
+    for it in chosen:
+        shown[it["source"]] = shown.get(it["source"], 0) + 1
+    stats = [f"{n}: {c['fetched']} fetched · {c['window']} in window · {c['eligible']} eligible · "
+             f"{shown.get(n, 0)} shown" for n, c in sorted(STATS.items())]
+    page, text = render(posts, papers, unvetted, general, training, errors, stats)
     if dry:
         Path("digest.html").write_text(page)
-        print(f"dry run: {len(posts)} posts, {len(papers)} papers, {len(unvetted)} unvetted, {len(training)} training, "
+        print(f"dry run: {len(posts)} posts, {len(papers)} papers, {len(unvetted)} unvetted, {len(general)} general, {len(training)} training, "
               f"{len(pool)} eligible in window, {len(errors)} feed errors")
         return
 
