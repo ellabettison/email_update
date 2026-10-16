@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -45,17 +45,60 @@ import feedparser
 # ---------------------------------------------------------------- config ---
 POST_RECENT = ((7, 6), (14, 4), (30, 2))   # (max age in days, ranking bonus) for posts
 POSTS_OLD_DAYS = 30       # a post older than this counts as "old" ...
-POSTS_OLD_MAX = 2         # ... and at most this many old posts per email
+POSTS_OLD_MAX = 1   # ... and at most this many old posts per email
 MAX_PER_AUTHOR = 2        # at most this many main papers per trusted author
 CITED_MAX_IDS = 40        # papers linked by trusted sources that we look up directly
 CITED_MAX_AGE_MONTHS = 2  # ... only if their arXiv id is this recent
 CITED_WINDOW_DAYS = 45
 CITED_BASE_SCORE = 8      # ranking base for an off-topic paper a trusted source links to
-PAPER_BUDGET = 10         # hard cap on papers per email, across ALL paper sections
-POSTS_SHOWN = 7           # "Blogs & newsletters"
-PAPERS_SHOWN = 6   # "Papers" (outside-approved)
-MAX_TRAINING = 1   # "Training & methods"
-MAX_PER_SOURCE = 4        # so one blog can't fill the posts section
+TOPICS = {
+    "model psychology": ["sycophancy", "sycophantic", "persona", "introspection", "deception", "deceptive",
+                         "honesty", "emergent misalignment", "alignment faking", "scheming", "subliminal",
+                         "personality", "self-report", "trait", "role-play", "persuasion", "manipulat",
+                         "character", "lie detect"],
+    "interpretability": ["interpretab", "mechanistic", "sparse autoencoder", "probe", "probing", "steering",
+                         "representation", "circuit", "attribution", "whitebox", "activation"],
+    "oversight & control": ["oversight", "monitor", "control", "sabotage", "untrusted", "chain-of-thought",
+                            "chain of thought", "audit", "collusion", "latent reasoning"],
+    "evals & capabilities": ["benchmark", "evaluation", "red-team", "red team", "dangerous capabilit",
+                             "propensit", "uplift", "autonomy", "incident", "capabilit"],
+    "training methods": ["rlhf", "reward", "preference", "post-training", "midtraining", "fine-tun",
+                         "distillation", "reinforcement learning", "constitutional", "alignment training",
+                         "pretraining", "rlvr", "dpo", "on-policy"],
+    "robustness & security": ["jailbreak", "adversarial", "backdoor", "poison", "attack", "robust",
+                              "prompt injection", "exploit", "vulnerab", "security"],
+    "governance & risk": ["policy", "governance", "regulat", "risk", "standard", "safety case", "assessment",
+                          "forecast", "responsible scaling", "frontier safety", "welfare"],
+    "agents": ["agent", "multi-agent", "memory", "tool use", "long-horizon", "autonomous"],
+}
+# Selection: first the single most important item on each topic (if it clears a quality
+# bar), then the rest purely by importance, so several strong items on one topic can
+# all appear. Minimums keep blogs and papers balanced.
+COVERAGE_SLOTS = 6        # at most this many "best on its topic" picks
+COVERAGE_MIN_RANK = 14    # ... and only if that item's rank is at least this
+MIN_POSTS = 3             # keep at least this many blog posts (if there are enough)
+MIN_PAPERS = 3            # ... and this many approved papers
+POSTS_MAX = 6
+PAPERS_MAX = 6
+TOTAL_ITEMS = 10          # hard cap on everything in one email (posts + papers + general)
+GENERAL_SHOWN = 2         # "General AI worth knowing": popular/buzzing papers, notable training papers, major-lab posts
+# "Lots of people are talking about this": Hacker News stories about AI with at least
+# this many points in the last HN_DAYS days are treated as buzz (no names hardcoded).
+HN_DAYS = 10
+HN_MIN_POINTS = 100
+AI_DOMAINS = ("arxiv.org", "huggingface.co", "openai.com", "anthropic.com", "deepmind.google",
+              "deepmind.com", "sakana.ai", "mistral.ai", "x.ai", "ai.meta.com", "research.google",
+              "lesswrong.com", "alignmentforum.org", "transformer-circuits.pub", "thinkingmachines.ai")
+AI_TITLE_RE = re.compile(
+    r"\b(AI|A\.I\.|LLMs?|GPT-?\d*|ChatGPT|Claude|Gemini|OpenAI|Anthropic|DeepMind|DeepSeek|"
+    r"Mistral|Llama|Qwen|Grok|neural networks?|language models?|machine learning|deep learning|"
+    r"reinforcement learning|foundation models?|reasoning models?|open[- ]weights?|agentic|RLHF|"
+    r"fine-tuning|self-improvement)\b", re.I)
+# Feeds whose text is only a boilerplate blurb: read the article itself (max N per run).
+THIN_SOURCES = {"Anthropic Research": 12, "Anthropic Frontier Red Team": 6,
+                "Google DeepMind": 8, "OpenAI Research": 8}
+BOILERPLATE = ("Anthropic is an AI safety and research company",)
+MAX_PER_SOURCE = 2   # so one blog can't fill the posts section
 MAX_AGE_HOURS = 30 * 24   # candidate window
 RECENT_DAYS, RECENT_BONUS = 7, 3    # ranking bonus: published in the last week
 MID_DAYS, MID_BONUS = 14, 1         # ... or the last two weeks
@@ -69,8 +112,6 @@ ENDORSE_BONUS = 4         # ranking points per trusted source that links a paper
 ENDORSE_MIN_BONUS = 3     # sources with at least this bonus count as trusted endorsers
 ON_TOPIC_REL = 6          # relevance needed for HF upvotes to count as approval (or a core term in the title)
 GENERAL_MIN_UPVOTES = 100 # popular papers on ANY AI topic qualify for "General AI"
-GENERAL_PAPERS = 2   # "General AI" papers
-GENERAL_POSTS = 2
 # Major AI blogs/newsletters whose non-safety posts can appear under "General AI".
 GENERAL_SOURCES = {"Interconnects", "Transformer", "Anthropic Research", "Google DeepMind",
                    "OpenAI Research", "Hugging Face blog", "Raschka"}
@@ -156,6 +197,11 @@ SAFETY_KEYWORDS = [
     "monitorability", "cot monitoring", "chain-of-thought monitoring", "ai monitor",
     "cot faithfulness", "chain-of-thought faithfulness", "safety training",
     "constitutional ai", "model spec", "alignment research", "alignment training",
+    "ai governance", "ai policy", "safety case", "responsible scaling", "frontier safety",
+    "model welfare", "prompt injection", "data poisoning", "adversarial robustness",
+    "specification gaming", "goal misgeneralization", "power-seeking", "corrigibility",
+    "agent foundations", "singular learning theory", "eliciting latent knowledge",
+    "weak-to-strong", "multi-agent safety", "dangerous capability",
 ]
 # Training-technique terms. Title hit = 2, body hit = 1. Never sufficient alone
 # for ordinary eligibility; they only qualify popular papers for the small slot.
@@ -206,6 +252,7 @@ def clean(text, limit=300):
 def clean_title(title, url=""):
     """Drop unrendered template placeholders such as '{title}'."""
     t = re.sub(r"\{[^{}]*\}", "", title or "")
+    t = re.sub(r"\s+[-|\u2013\u2014]\s+[^-|\u2013\u2014]{0,40}\bBlog\s*$", "", t, flags=re.I)
     t = re.sub(r"\s+", " ", t).strip()
     if not t and url:
         slug = url.rstrip("/").rsplit("/", 1)[-1]
@@ -230,6 +277,20 @@ def norm_name(n):
 
 
 TRUSTED_NORM = {norm_name(a) for a in TRUSTED_AUTHORS}
+
+
+TOPIC_RE = {t: [re.compile(r"\b" + re.escape(k), re.I) for k in kws] for t, kws in TOPICS.items()}
+
+
+def topic_of(it):
+    """Crude topic bucket (used only to keep the email varied)."""
+    title, text = it.get("title", ""), it.get("summary", "")
+    best, best_n = "general AI", 0
+    for topic, rxs in TOPIC_RE.items():
+        n = sum(2 for rx in rxs if rx.search(title)) + sum(1 for rx in rxs if rx.search(text))
+        if n > best_n:
+            best, best_n = topic, n
+    return best
 
 
 def trusted_in(entry):
@@ -543,6 +604,9 @@ def stat(source, key, n=1):
     d[key] += n
 
 
+BUZZ = {}          # normalised url -> {"points", "comments", "url"} for AI stories on HN
+BUZZ_PAPERS = {}   # arXiv id -> same, for papers linked from HN
+HF_LINK_RE = re.compile(r"huggingface\.co/papers/(\d{4}\.\d{4,5})", re.I)
 ARXIV_LINK_RE = re.compile(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", re.I)
 ENDORSEMENTS = {}   # arXiv id -> set of trusted source names that link to it
 
@@ -589,6 +653,34 @@ def parse_feed(url, retries=0):
     return feed, diag
 
 
+FETCHES = {}   # per-run counter for richer_text()
+
+
+def richer_text(name, link, raw):
+    """Some feeds give only a boilerplate blurb. For a few sources, read the article."""
+    plain = clean(raw, 400)
+    boiler = plain.startswith(BOILERPLATE)
+    cap = THIN_SOURCES.get(name)
+    if not cap or (len(plain) >= 80 and not boiler):
+        return "" if boiler else raw
+    if FETCHES.get(name, 0) >= cap or not (link or "").startswith("http"):
+        return "" if boiler else raw
+    FETCHES[name] = FETCHES.get(name, 0) + 1
+    try:
+        art, _ = http_get(link)
+    except Exception:
+        return "" if boiler else raw
+    time.sleep(1)
+    ap = _LinkMeta()
+    ap.feed(art)
+    meta = ap.meta.get("og:description") or ap.meta.get("description") or ""
+    if clean(meta).startswith(BOILERPLATE):
+        meta = ""
+    body = " ".join(p for p in ap.paragraphs if len(p) >= 60)[:1500]
+    text = f"{meta} {body}".strip()
+    return text or ("" if boiler else raw)
+
+
 def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
     items = []
     for e in entries:
@@ -608,6 +700,8 @@ def entries_to_items(entries, name, always, bonus, is_paper, seen, cutoff):
             note_endorsements(name, bonus, blob)
         if not uid or uid in seen:
             continue
+        if not is_paper:
+            raw = richer_text(name, e.get("link", ""), raw)
         title = clean_title(clean(e.get("title"), 200), e.get("link", ""))
         # Some feeds (LessWrong) ship the whole post: score the opening ~1500
         # chars, but only show 320.
@@ -853,7 +947,7 @@ def fetch_cited_papers(items, seen, now, errors, deadline):
     have = {i["id"] for i in items}
     idx_now = (now.year % 100) * 12 + now.month
     ids = []
-    for pid in sorted(ENDORSEMENTS, reverse=True):               # newest ids first
+    for pid in sorted(set(ENDORSEMENTS) | set(BUZZ_PAPERS), reverse=True):   # newest ids first
         if f"arxiv:{pid}" in seen or f"arxiv:{pid}" in have:
             continue
         idx = int(pid[:2]) * 12 + int(pid[2:4])
@@ -897,6 +991,77 @@ def fetch_cited_papers(items, seen, now, errors, deadline):
     return out
 
 
+def fetch_hn(seen, now, errors):
+    """Hacker News stories about AI with lots of points: a direct measure of
+    'lots of people are talking about this'. Papers linked from HN feed
+    BUZZ_PAPERS; other stories become General-AI candidates (or ordinary posts
+    if they match the safety keywords)."""
+    ts = int((now - timedelta(days=HN_DAYS)).timestamp())
+    url = ("https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=500"
+           f"&numericFilters=created_at_i%3E{ts},points%3E{HN_MIN_POINTS - 1}")
+    try:
+        data = json.loads(http_get(url)[0])
+    except Exception as exc:
+        errors.append(f"Hacker News: {exc}")
+        return []
+    src, items = "Hacker News", []
+    for h in data.get("hits", []):
+        stat(src, "fetched")
+        title = clean_title(h.get("title") or "")
+        link = h.get("url") or ""
+        host = urlparse(link).netloc.lower().removeprefix("www.")
+        if not (AI_TITLE_RE.search(title) or score(title, "")[1]
+                or any(host == d or host.endswith("." + d) for d in AI_DOMAINS)):
+            continue
+        stat(src, "window")
+        pts, com = h.get("points") or 0, h.get("num_comments") or 0
+        hn_link = f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+        buzz = {"points": pts, "comments": com, "url": hn_link}
+        m = ARXIV_LINK_RE.search(link) or HF_LINK_RE.search(link)
+        if m:
+            BUZZ_PAPERS[m.group(1)] = buzz
+            continue
+        if link:
+            BUZZ[norm_url(link)] = buzz
+        uid = f"hn:{h.get('objectID')}"
+        if uid in seen:
+            continue
+        rel, strong, train = score(title, "")
+        general = not (strong and rel >= MIN_RELEVANCE)
+        when = datetime.fromtimestamp(h.get("created_at_i") or 0, timezone.utc)
+        stat(src, "eligible")
+        items.append({
+            "id": uid, "source": src, "title": title, "summary": "", "link": link or hn_link,
+            "score": min(pts // 40, 12) + min(com // 100, 4) + (0 if general else min(rel, REL_CAP)),
+            "rel": rel, "strong": strong, "training_only": False, "general": general,
+            "trusted": [], "approvals": [], "upvotes": None, "buzz": buzz,
+            "date": fmt_date(when), "when": when, "kind": "post",
+        })
+    return items
+
+
+def apply_buzz(items):
+    """Extra weight for anything many people are discussing on Hacker News, and
+    drop an HN story when we already have the same article from a feed."""
+    have = {norm_url(i.get("link", "")) for i in items if i["source"] != "Hacker News"}
+    out = []
+    for it in items:
+        if it["source"] == "Hacker News":
+            if norm_url(it["link"]) in have:
+                continue                                   # same article already present
+            out.append(it)
+            continue
+        b = BUZZ.get(norm_url(it.get("link", ""))) or \
+            (BUZZ_PAPERS.get(it["id"][6:]) if it["id"].startswith("arxiv:") else None)
+        if b:
+            it["buzz"] = b
+            it["score"] += min(b["points"] // 50, 6)
+            if it.get("kind") == "paper":
+                it["approvals"] = list(it.get("approvals", [])) + ["hn"]
+        out.append(it)
+    return out
+
+
 def merge(items):
     """Same paper/post can arrive via several feeds or queries: keep the
     best-scored copy but pool the approvals, trusted authors and upvotes."""
@@ -913,6 +1078,7 @@ def merge(items):
         ups = [u for u in (win.get("upvotes"), lose.get("upvotes")) if u]
         m["upvotes"] = max(ups) if ups else None
         m["general"] = bool(win.get("general") and lose.get("general"))
+        m["buzz"] = win.get("buzz") or lose.get("buzz")
         best[it["id"]] = m
     return sorted(best.values(), key=lambda x: x["score"], reverse=True)
 
@@ -984,42 +1150,74 @@ def select(items, now=None):
     pool = merge(items)
     for it in pool:
         it["rank"] = it["score"] + recency_bonus(it.get("when"), now, it.get("kind"))
+        it["topic"] = topic_of(it)
     pool.sort(key=lambda x: x["rank"], reverse=True)
-    live = [i for i in pool if not i["training_only"] and not i.get("general")]
     paper = lambda i: i.get("kind") == "paper"
-    gen = [i for i in pool if i.get("general") and not i["training_only"]]
-    posts = take_posts([i for i in live if not paper(i)], POSTS_SHOWN, MAX_PER_SOURCE, now)
+    live = [i for i in pool if not i["training_only"] and not i.get("general")]
+    gen = [i for i in pool if i.get("general") or i["training_only"]]
 
-    # Papers share one budget (PAPER_BUDGET) across four sections. Each section
-    # has a quota; slots a section can't fill flow to the next, most trusted first.
-    # A main paper slot needs outside approval; strong keyword matches without
-    # any approval go in a small, clearly labelled extra section.
-    cands = {
-        "papers": take_authors([i for i in live if paper(i) and i.get("approvals")], MAX_PER_AUTHOR),
-        "unvetted": [i for i in live if paper(i) and not i.get("approvals")
-                     and i.get("rel", 0) >= UNVETTED_MIN_REL],
-        "general": [i for i in gen if paper(i)],
-        "training": [i for i in pool if i["training_only"]],
-    }
-    quota = {"papers": PAPERS_SHOWN, "unvetted": UNVETTED_SHOWN,
-             "general": GENERAL_PAPERS, "training": MAX_TRAINING}
-    chosen = {k: cands[k][:quota[k]] for k in cands}
-    spare = PAPER_BUDGET - sum(len(v) for v in chosen.values())
-    for k in ("papers", "general", "training", "unvetted"):
-        if spare <= 0:
+    # Candidates (best first). Per-source / per-author / old-post limits are applied
+    # here, in rank order, so any subset of these lists respects them.
+    posts_c = take_posts([i for i in live if not paper(i)], 999, MAX_PER_SOURCE, now)
+    papers_c = take_authors([i for i in live if paper(i) and i.get("approvals")], MAX_PER_AUTHOR)
+    # Papers without outside approval go in the small, clearly labelled "unvetted" section.
+    unvetted_c = [i for i in live if paper(i) and not i.get("approvals")
+                  and i.get("rel", 0) >= UNVETTED_MIN_REL]
+    section = {}
+    for i in posts_c:
+        section[i["id"]] = "posts"
+    for i in papers_c:
+        section[i["id"]] = "papers"
+    for i in gen:
+        section[i["id"]] = "general"
+    core = sorted(posts_c + papers_c + gen, key=lambda x: x["rank"], reverse=True)
+    caps = {"posts": POSTS_MAX, "papers": PAPERS_MAX, "general": GENERAL_SHOWN}
+
+    chosen = {"posts": [], "papers": [], "general": [], "unvetted": []}
+    picked = set()
+
+    def total():
+        return sum(len(v) for v in chosen.values())
+
+    def add(it, sec):
+        chosen[sec].append(it)
+        picked.add(it["id"])
+
+    if unvetted_c and UNVETTED_SHOWN:                     # reserved slot(s)
+        for it in unvetted_c[:UNVETTED_SHOWN]:
+            add(it, "unvetted")
+
+    # 1. Coverage: the most important item on each topic (not merely the first one
+    #    seen), strongest topics first, only if it is important enough.
+    best = {}
+    for it in core:                                      # core is rank-sorted
+        if it["rank"] >= COVERAGE_MIN_RANK:
+            best.setdefault(it["topic"], it)
+    for it in sorted(best.values(), key=lambda x: x["rank"], reverse=True)[:COVERAGE_SLOTS]:
+        sec = section[it["id"]]
+        if total() < TOTAL_ITEMS and len(chosen[sec]) < caps[sec]:
+            add(it, sec)
+
+    # 2. Balance: keep blogs and papers both represented.
+    for sec, floor in (("posts", MIN_POSTS), ("papers", MIN_PAPERS)):
+        for it in core:
+            if len(chosen[sec]) >= floor or total() >= TOTAL_ITEMS:
+                break
+            if section[it["id"]] == sec and it["id"] not in picked:
+                add(it, sec)
+
+    # 3. Everything else purely by importance, so several strong items on the same
+    #    topic can all be included.
+    for it in core:
+        if total() >= TOTAL_ITEMS:
             break
-        extra = cands[k][len(chosen[k]):len(chosen[k]) + spare]
-        chosen[k] += extra
-        spare -= len(extra)
-    over = sum(len(v) for v in chosen.values()) - PAPER_BUDGET
-    for k in ("unvetted", "training", "general", "papers"):   # trim if quotas were set too high
-        while over > 0 and chosen[k]:
-            chosen[k].pop()
-            over -= 1
+        sec = section[it["id"]]
+        if it["id"] not in picked and len(chosen[sec]) < caps[sec]:
+            add(it, sec)
 
-    gen_posts = take([i for i in gen if not paper(i)], GENERAL_POSTS, GENERAL_POSTS)
-    general = sorted(chosen["general"] + gen_posts, key=lambda x: x["rank"], reverse=True)
-    return posts, chosen["papers"], chosen["unvetted"], general, chosen["training"], pool
+    for k in chosen:
+        chosen[k].sort(key=lambda x: x["rank"], reverse=True)
+    return chosen["posts"], chosen["papers"], chosen["unvetted"], chosen["general"], [], pool
 
 
 # ----------------------------------------------------------------- output ---
@@ -1037,14 +1235,21 @@ def render(posts, papers, unvetted, general, training, errors, stats=None):
         if cited:
             badge += (" &middot; <span style='color:#2a6'>cited by "
                       + html.escape(", ".join(cited)) + "</span>")
+        if it.get("buzz"):
+            b = it["buzz"]
+            badge += (f" &middot; <a href='{html.escape(b['url'])}' style='color:#c60;"
+                      f"text-decoration:none'>Hacker News &#9650; {b['points']} "
+                      f"&middot; {b['comments']} comments</a>")
         date_html = (f" &middot; {html.escape(it['date'])}" if it.get("date")
                      else " &middot; <span style='color:#999'>date unknown</span>")
+        topic_html = f" &middot; {html.escape(it['topic'])}" if it.get("topic") else ""
         return (
             "<div style='margin:0 0 14px'>"
             f"<a href='{html.escape(it['link'])}' style='font-weight:600;"
             f"text-decoration:none'>{html.escape(it['title'])}</a>"
-            f"<div style='color:#666;font-size:12px'>{html.escape(it['source'])}{date_html}{badge}</div>"
-            f"<div style='font-size:14px;margin-top:2px'>{html.escape(clean(it['summary'], n))}</div>"
+            f"<div style='color:#666;font-size:12px'>{html.escape(it['source'])}{date_html}{topic_html}{badge}</div>"
+            + (f"<div style='font-size:14px;margin-top:2px'>{html.escape(clean(it['summary'], n))}</div>"
+               if it["summary"] else "") +
             "</div>"
         )
 
@@ -1062,7 +1267,7 @@ def render(posts, papers, unvetted, general, training, errors, stats=None):
                     "or link from a trusted source (yet).")
             + block("General AI worth knowing", general, 240,
                     "Not safety-specific: picked for popularity (100+ Hugging Face upvotes) "
-                    "or because it's from a major AI blog or newsletter.")
+                    "or Hacker News buzz, or because it's from a major AI blog or newsletter, or a notable training paper.")
             + block("Training &amp; methods", training, 180))
     if not body:
         body = "<p>Nothing new matched this week.</p>"
@@ -1115,6 +1320,9 @@ def main():
     seen = load_seen()
     ENDORSEMENTS.clear()
     STATS.clear()
+    FETCHES.clear()
+    BUZZ.clear()
+    BUZZ_PAPERS.clear()
     errors, items = [], []
 
     for name, url, always, bonus in FEEDS:
@@ -1141,11 +1349,13 @@ def main():
             errors.append("arXiv: three queries in a row failed, remaining skipped")
             break
     items += fetch_hf_papers(seen, now, errors)
+    items += fetch_hn(seen, now, errors)
     if failed_in_a_row < 3 and time.time() < deadline:
         time.sleep(ARXIV_GAP)
         items += fetch_cited_papers(items, seen, now, errors, deadline)
 
     apply_endorsements(items)
+    items = apply_buzz(items)
     posts, papers, unvetted, general, training, pool = select(items, now)
     chosen = posts + papers + unvetted + general + training
     enrich_descriptions(chosen)
@@ -1154,6 +1364,8 @@ def main():
         shown[it["source"]] = shown.get(it["source"], 0) + 1
     stats = [f"{n}: {c['fetched']} fetched · {c['window']} in window · {c['eligible']} eligible · "
              f"{shown.get(n, 0)} shown" for n, c in sorted(STATS.items())]
+    if any(n == "Hacker News" for n in STATS):
+        stats.append("Hacker News data: search by Algolia (hn.algolia.com)")
     page, text = render(posts, papers, unvetted, general, training, errors, stats)
     if dry:
         Path("digest.html").write_text(page)
