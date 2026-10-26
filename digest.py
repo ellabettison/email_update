@@ -74,6 +74,7 @@ TOPICS = {
 # Selection: first the single most important item on each topic (if it clears a quality
 # bar), then the rest purely by importance, so several strong items on one topic can
 # all appear. Minimums keep blogs and papers balanced.
+GENERAL_RESERVED = 1      # this many General-AI slots are guaranteed (the best general item(s) each week)
 COVERAGE_SLOTS = 6        # at most this many "best on its topic" picks
 COVERAGE_MIN_RANK = 14    # ... and only if that item's rank is at least this
 MIN_POSTS = 3             # keep at least this many blog posts (if there are enough)
@@ -86,6 +87,7 @@ GENERAL_SHOWN = 2         # "General AI worth knowing": popular/buzzing papers, 
 # this many points in the last HN_DAYS days are treated as buzz (no names hardcoded).
 HN_DAYS = 10
 HN_MIN_POINTS = 100
+HN_MAX_ITEMS = 1          # at most this many standalone Hacker News stories per email
 AI_DOMAINS = ("arxiv.org", "huggingface.co", "openai.com", "anthropic.com", "deepmind.google",
               "deepmind.com", "sakana.ai", "mistral.ai", "x.ai", "ai.meta.com", "research.google",
               "lesswrong.com", "alignmentforum.org", "transformer-circuits.pub", "thinkingmachines.ai")
@@ -93,7 +95,7 @@ AI_TITLE_RE = re.compile(
     r"\b(AI|A\.I\.|LLMs?|GPT-?\d*|ChatGPT|Claude|Gemini|OpenAI|Anthropic|DeepMind|DeepSeek|"
     r"Mistral|Llama|Qwen|Grok|neural networks?|language models?|machine learning|deep learning|"
     r"reinforcement learning|foundation models?|reasoning models?|open[- ]weights?|agentic|RLHF|"
-    r"fine-tuning|self-improvement)\b", re.I)
+    r"fine-tuning|self-improvement|chatbots?|sycophancy|jailbreaks?|alignment faking)\b", re.I)
 # Feeds whose text is only a boilerplate blurb: read the article itself (max N per run).
 THIN_SOURCES = {"Anthropic Research": 12, "Anthropic Frontier Red Team": 6,
                 "Google DeepMind": 8, "OpenAI Research": 8}
@@ -1010,7 +1012,7 @@ def fetch_hn(seen, now, errors):
         title = clean_title(h.get("title") or "")
         link = h.get("url") or ""
         host = urlparse(link).netloc.lower().removeprefix("www.")
-        if not (AI_TITLE_RE.search(title) or score(title, "")[1]
+        if not (AI_TITLE_RE.search(title)
                 or any(host == d or host.endswith("." + d) for d in AI_DOMAINS)):
             continue
         stat(src, "window")
@@ -1027,12 +1029,12 @@ def fetch_hn(seen, now, errors):
         if uid in seen:
             continue
         rel, strong, train = score(title, "")
-        general = not (strong and rel >= MIN_RELEVANCE)
+        general = True            # HN stories never take a main blog/paper slot
         when = datetime.fromtimestamp(h.get("created_at_i") or 0, timezone.utc)
         stat(src, "eligible")
         items.append({
             "id": uid, "source": src, "title": title, "summary": "", "link": link or hn_link,
-            "score": min(pts // 40, 12) + min(com // 100, 4) + (0 if general else min(rel, REL_CAP)),
+            "score": min(pts // 100, 5) + min(com // 200, 2),
             "rel": rel, "strong": strong, "training_only": False, "general": general,
             "trusted": [], "approvals": [], "upvotes": None, "buzz": buzz,
             "date": fmt_date(when), "when": when, "kind": "post",
@@ -1055,7 +1057,7 @@ def apply_buzz(items):
             (BUZZ_PAPERS.get(it["id"][6:]) if it["id"].startswith("arxiv:") else None)
         if b:
             it["buzz"] = b
-            it["score"] += min(b["points"] // 50, 6)
+            it["score"] += min(b["points"] // 100, 4)
             if it.get("kind") == "paper":
                 it["approvals"] = list(it.get("approvals", [])) + ["hn"]
         out.append(it)
@@ -1154,7 +1156,14 @@ def select(items, now=None):
     pool.sort(key=lambda x: x["rank"], reverse=True)
     paper = lambda i: i.get("kind") == "paper"
     live = [i for i in pool if not i["training_only"] and not i.get("general")]
-    gen = [i for i in pool if i.get("general") or i["training_only"]]
+    gen, n_hn = [], 0
+    for i in pool:
+        if i.get("general") or i["training_only"]:
+            if i["source"] == "Hacker News":
+                n_hn += 1
+                if n_hn > HN_MAX_ITEMS:
+                    continue
+            gen.append(i)
 
     # Candidates (best first). Per-source / per-author / old-post limits are applied
     # here, in rank order, so any subset of these lists respects them.
@@ -1180,12 +1189,18 @@ def select(items, now=None):
         return sum(len(v) for v in chosen.values())
 
     def add(it, sec):
+        if it["id"] in picked:                  # never include the same item twice
+            return
         chosen[sec].append(it)
         picked.add(it["id"])
 
     if unvetted_c and UNVETTED_SHOWN:                     # reserved slot(s)
         for it in unvetted_c[:UNVETTED_SHOWN]:
             add(it, "unvetted")
+
+    for it in [i for i in core if section[i["id"]] == "general"][:GENERAL_RESERVED]:
+        if total() < TOTAL_ITEMS and it["id"] not in picked:
+            add(it, "general")                                # reserved: the best general item
 
     # 1. Coverage: the most important item on each topic (not merely the first one
     #    seen), strongest topics first, only if it is important enough.
@@ -1195,7 +1210,7 @@ def select(items, now=None):
             best.setdefault(it["topic"], it)
     for it in sorted(best.values(), key=lambda x: x["rank"], reverse=True)[:COVERAGE_SLOTS]:
         sec = section[it["id"]]
-        if total() < TOTAL_ITEMS and len(chosen[sec]) < caps[sec]:
+        if total() < TOTAL_ITEMS and len(chosen[sec]) < caps[sec] and it["id"] not in picked:
             add(it, sec)
 
     # 2. Balance: keep blogs and papers both represented.
