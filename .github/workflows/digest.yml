@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write           # needed to commit seen.json back
 
+concurrency:                # two overlapping runs would overwrite each other's seen.json
+  group: weekly-digest
+  cancel-in-progress: false
+
 jobs:
   digest:
     runs-on: ubuntu-latest
@@ -27,4 +31,12 @@ jobs:
           git config user.name "digest-bot"
           git config user.email "digest-bot@users.noreply.github.com"
           git add seen.json
-          git diff --staged --quiet || (git commit -m "update seen list" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "update seen list"
+            for i in 1 2 3; do
+              git pull --rebase -X theirs origin "$GITHUB_REF_NAME" && git push && exit 0
+              sleep 5
+            done
+            echo "::error::could not push seen.json, so already-sent items may be sent again"
+            exit 1
+          fi
