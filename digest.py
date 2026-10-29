@@ -45,7 +45,8 @@ import feedparser
 # ---------------------------------------------------------------- config ---
 POST_RECENT = ((7, 6), (14, 4), (30, 2))   # (max age in days, ranking bonus) for posts
 POSTS_OLD_DAYS = 30       # a post older than this counts as "old" ...
-POSTS_OLD_MAX = 1   # ... and at most this many old posts per email
+POSTS_OLD_MAX = 3   # ordinary old posts allowed per email; important old posts are exempt
+OLD_POST_IMPORTANT_RANK = 17   # an old post ranked at least this is never limited by POSTS_OLD_MAX
 MAX_PER_AUTHOR = 2        # at most this many main papers per trusted author
 CITED_MAX_IDS = 40        # papers linked by trusted sources that we look up directly
 CITED_MAX_AGE_MONTHS = 2  # ... only if their arXiv id is this recent
@@ -269,6 +270,10 @@ def kw_regex(kw):
 PRIORITY_RE = [kw_regex(k) for k in PRIORITY_KEYWORDS]
 SAFETY_RE = [kw_regex(k) for k in SAFETY_KEYWORDS]
 TRAINING_RE = [kw_regex(k) for k in TRAINING_KEYWORDS]
+LLM_CONTEXT_RE = re.compile(
+    r"\b(language models?|LLMs?|reasoning models?|chatbots?|AI assistants?|agents?|agentic|"
+    r"reinforcement learning|post-training|pre-?training|RLHF|RLVR|alignment|test-time|"
+    r"in-context|chain[- ]of[- ]thought|scaling laws?)\b", re.I)
 LLM_RE = re.compile(r"\b(language models?|LLMs?|reasoning models?|chatbots?|AI assistants?)\b", re.I)
 
 
@@ -916,7 +921,8 @@ def fetch_hf_papers(seen, now, errors):
         # a core term in the title, or a strong overall keyword match.
         topical = rel >= ON_TOPIC_REL or score(title, "")[1]
         general = False
-        if upv >= GENERAL_MIN_UPVOTES and not topical and not training_only and not trusted:
+        if upv >= GENERAL_MIN_UPVOTES and not topical and not training_only and not trusted \
+                and LLM_CONTEXT_RE.search(f"{title} {abstract}"):
             ok, general = True, True        # popular, but not safety-specific
         if not ok:
             continue
@@ -1126,7 +1132,8 @@ def take_posts(items, n, per_source, now):
         w = it.get("when")
         if w and w.tzinfo is None:
             w = w.replace(tzinfo=timezone.utc)
-        is_old = bool(w) and (now - w) > timedelta(days=POSTS_OLD_DAYS)
+        is_old = bool(w) and (now - w) > timedelta(days=POSTS_OLD_DAYS) \
+            and it.get("rank", 0) < OLD_POST_IMPORTANT_RANK
         if is_old and old >= POSTS_OLD_MAX:
             continue
         old += is_old
